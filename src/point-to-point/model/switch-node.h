@@ -41,6 +41,7 @@ private:
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 public:
 	Ptr<SwitchMmu> m_mmu;
+	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDrop;
 
 	static TypeId GetTypeId (void);
 	SwitchNode();

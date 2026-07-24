@@ -24,6 +24,7 @@
 #include "ns3/qbb-net-device.h"
 #include "ns3/log.h"
 #include "ns3/boolean.h"
+#include "ns3/integer.h"
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 #include "ns3/data-rate.h"
@@ -110,12 +111,12 @@ namespace ns3 {
 				int tag = qp->GetTag();
 				int t_count = qp->GetInitialSize();
 			}
-			if (!paused[qp->m_pg] && qp->GetBytesLeft() > 0 && !qp->IsWinBound()){
+			if (!qp->IsFailed() && !paused[qp->m_pg] && qp->GetBytesLeft() > 0 && !qp->IsWinBound()){
 				if (m_qpGrp->Get(idx)->m_nextAvail.GetTimeStep() > Simulator::Now().GetTimeStep()) //not available now
 					continue;
 				res = idx;
 				break;
-			}else if (qp->IsFinished()){
+			}else if (qp->IsFinished() || qp->IsFailed()){
 				min_finish_id = idx < min_finish_id ? idx : min_finish_id;
 			}
 		}
@@ -124,7 +125,7 @@ namespace ns3 {
 		if (min_finish_id < 0xffffffff){
 			int nxt = min_finish_id;
 			auto &qps = m_qpGrp->m_qps;
-			for (int i = min_finish_id + 1; i < fcount; i++) if (!qps[i]->IsFinished()){
+			for (int i = min_finish_id + 1; i < fcount; i++) if (!qps[i]->IsFinished() && !qps[i]->IsFailed()){
 				if (i == res) // update res to the idx after removing finished qp
 					res = nxt;
 				qps[nxt] = qps[i];
@@ -195,6 +196,43 @@ namespace ns3 {
 				BooleanValue(false),
 				MakeBooleanAccessor(&QbbNetDevice::m_dynamicth),
 				MakeBooleanChecker())
+			.AddAttribute("DataLossErrorModel",
+				"Error model applied only to classified data-plane packets.",
+				PointerValue(),
+				MakePointerAccessor(&QbbNetDevice::m_dataLossErrorModel),
+				MakePointerChecker<ErrorModel>())
+			.AddAttribute("DataLossStartNs",
+				"Simulation time at which the data impairment becomes active.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&QbbNetDevice::m_dataLossStartNs),
+				MakeUintegerChecker<uint64_t>())
+			.AddAttribute("DataLossDurationNs",
+				"Duration of the data-plane impairment; zero disables it.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&QbbNetDevice::m_dataLossDurationNs),
+				MakeUintegerChecker<uint64_t>())
+			.AddAttribute("DataLossScope",
+				"0=all, 1=host-to-switch, 2=switch-to-host, 3=switch-to-switch.",
+				UintegerValue(static_cast<uint32_t>(DataLossScope::All)),
+				MakeUintegerAccessor(&QbbNetDevice::m_dataLossScope),
+				MakeUintegerChecker<uint32_t>(
+					static_cast<uint32_t>(DataLossScope::All),
+					static_cast<uint32_t>(DataLossScope::SwitchToSwitch)))
+			.AddAttribute("DataLossSourceHost",
+				"Optional original source-host filter; -1 selects all hosts.",
+				IntegerValue(-1),
+				MakeIntegerAccessor(&QbbNetDevice::m_dataLossSourceHost),
+				MakeIntegerChecker<int32_t>())
+			.AddAttribute("DataLossDestinationHost",
+				"Optional original destination-host filter; -1 selects all hosts.",
+				IntegerValue(-1),
+				MakeIntegerAccessor(&QbbNetDevice::m_dataLossDestinationHost),
+				MakeIntegerChecker<int32_t>())
+			.AddAttribute("DataLossReceiverNode",
+				"Optional receiver-node filter; -1 selects all QBB receivers.",
+				IntegerValue(-1),
+				MakeIntegerAccessor(&QbbNetDevice::m_dataLossReceiverNode),
+				MakeIntegerChecker<int32_t>())
 			.AddAttribute("PauseTime",
 				"Number of microseconds to pause upon congestion",
 				UintegerValue(5),
@@ -225,6 +263,27 @@ namespace ns3 {
 			.AddTraceSource ("QbbPfc", "get a PFC packet. 0: resume, 1: pause",
 					MakeTraceSourceAccessor (&QbbNetDevice::m_tracePfc),
 					"ns3::Packet::TraceCallback")
+			.AddTraceSource ("DataPlaneAttempt", "Classified data packet reached the receive boundary.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceDataPlaneAttempt),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("DataPlaneDeliver", "Classified data packet survived configured impairment.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceDataPlaneDeliver),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("DataPlaneLoss", "Configured data-plane impairment dropped a packet.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceDataPlaneLoss),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("ControlPlaneAttempt", "Classified control packet reached the receive boundary.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceControlPlaneAttempt),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("ControlPlaneDeliver", "Control packet bypassed configured data impairment.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceControlPlaneDeliver),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("QueueEnqueue", "Packet entered a modeled QBB queue.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceQueueEnqueue),
+				"ns3::Packet::TracedCallback")
+			.AddTraceSource ("QueueDequeue", "Packet left a modeled QBB queue.",
+				MakeTraceSourceAccessor (&QbbNetDevice::m_traceQueueDequeue),
+				"ns3::Packet::TracedCallback")
 			;
 
 		return tid;
@@ -239,6 +298,48 @@ namespace ns3 {
 		}
 
 		m_rdmaEQ = CreateObject<RdmaEgressQueue>();
+	}
+
+	bool QbbNetDevice::DataLossScopeMatches(const CustomHeader& ch) const
+	{
+		if (!m_dataLossErrorModel || m_dataLossDurationNs == 0 ||
+			ch.l3Prot != 0x11) {
+			return false;
+		}
+		const uint64_t now = Simulator::Now().GetNanoSeconds();
+		if (now < m_dataLossStartNs || now - m_dataLossStartNs >= m_dataLossDurationNs) {
+			return false;
+		}
+		if (m_dataLossReceiverNode >= 0 &&
+			static_cast<uint32_t>(m_dataLossReceiverNode) != m_node->GetId()) {
+			return false;
+		}
+		const int32_t sourceHost = static_cast<int32_t>((ch.sip >> 8) & 0xffff);
+		const int32_t destinationHost = static_cast<int32_t>((ch.dip >> 8) & 0xffff);
+		if ((m_dataLossSourceHost >= 0 && sourceHost != m_dataLossSourceHost) ||
+			(m_dataLossDestinationHost >= 0 && destinationHost != m_dataLossDestinationHost)) {
+			return false;
+		}
+		if (!m_channel) {
+			return false;
+		}
+		Ptr<QbbNetDevice> source = m_channel->GetQbbDevice(0);
+		if (source == this) {
+			source = m_channel->GetQbbDevice(1);
+		}
+		const bool sourceIsHost = source->GetNode()->GetNodeType() == 0;
+		const bool receiverIsHost = m_node->GetNodeType() == 0;
+		switch (static_cast<DataLossScope>(m_dataLossScope)) {
+		case DataLossScope::All:
+			return true;
+		case DataLossScope::HostToSwitch:
+			return sourceIsHost && !receiverIsHost;
+		case DataLossScope::SwitchToHost:
+			return !sourceIsHost && receiverIsHost;
+		case DataLossScope::SwitchToSwitch:
+			return !sourceIsHost && !receiverIsHost;
+		}
+		return false;
 	}
 
 	QbbNetDevice::~QbbNetDevice()
@@ -279,6 +380,7 @@ namespace ns3 {
 				if (qIndex == -1){ // high prio
 					p = m_rdmaEQ->DequeueQindex(qIndex);
 					m_traceDequeue(p, 0);
+					m_traceQueueDequeue(p, 0);
 					TransmitStart(p);
 					return;
 				}
@@ -287,6 +389,7 @@ namespace ns3 {
 				p = m_rdmaEQ->DequeueQindex(qIndex);
 				// transmit
 				m_traceQpDequeue(p, lastQp);
+				m_traceQueueDequeue(p, lastQp->m_pg);
 				TransmitStart(p);
 
 				// update for the next avail time
@@ -323,6 +426,7 @@ namespace ns3 {
 					p->RemovePacketTag(t);
 				}
 				m_traceDequeue(p, qIndex);
+				m_traceQueueDequeue(p, qIndex);
 				TransmitStart(p);
 				return;
 			}else{ //No queue can deliver any packet
@@ -362,28 +466,32 @@ namespace ns3 {
 			return;
 		}
 
-		if (m_receiveErrorModel && m_receiveErrorModel->IsCorrupt(packet))
-		{
-			//
-			// If we have an error model and it indicates that it is time to lose a
-			// corrupted packet, don't forward this packet up, let it go.
-			//
-			m_phyRxDropTrace(packet);
-			return;
-		}
-
-		m_macRxTrace(packet);
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
 		packet->PeekHeader(ch);
+		const bool isDataPlane = ch.l3Prot == 0x11;
+		if (isDataPlane) {
+			m_traceDataPlaneAttempt(packet, ch.l3Prot);
+			if (DataLossScopeMatches(ch) && m_dataLossErrorModel->IsCorrupt(packet)) {
+				m_traceDataPlaneLoss(packet, ch.l3Prot);
+				m_phyRxDropTrace(packet);
+				return;
+			}
+			m_traceDataPlaneDeliver(packet, ch.l3Prot);
+		} else {
+			m_traceControlPlaneAttempt(packet, ch.l3Prot);
+			m_traceControlPlaneDeliver(packet, ch.l3Prot);
+		}
+
+		m_macRxTrace(packet);
 		if (ch.l3Prot == 0xFE){ // PFC
 			if (!m_qbbEnabled) return;
 			unsigned qIndex = ch.pfc.qIndex;
 			if (ch.pfc.time > 0){
-				m_tracePfc(1);
+				m_tracePfc(1, qIndex);
 				m_paused[qIndex] = true;
 			}else{
-				m_tracePfc(0);
+				m_tracePfc(0, qIndex);
 				Resume(qIndex);
 			}
 		}else { // non-PFC packets (data, ACK, NACK, CNP...)
@@ -408,7 +516,11 @@ namespace ns3 {
 	bool QbbNetDevice::SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch){
 		m_macTxTrace(packet);
 		m_traceEnqueue(packet, qIndex);
-		m_queue->Enqueue(packet, qIndex);
+		m_traceQueueEnqueue(packet, qIndex);
+		if (!m_queue->Enqueue(packet, qIndex)) {
+			m_traceDrop(packet, qIndex);
+			return false;
+		}
 		DequeueAndTransmit();
 		return true;
 	}
@@ -535,6 +647,7 @@ namespace ns3 {
 
 	void QbbNetDevice::RdmaEnqueueHighPrioQ(Ptr<Packet> p){
 		m_traceEnqueue(p, 0);
+		m_traceQueueEnqueue(p, 0);
 		m_rdmaEQ->EnqueueHighPrioQ(p);
 	}
 

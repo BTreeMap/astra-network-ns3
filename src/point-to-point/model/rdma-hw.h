@@ -35,6 +35,8 @@ public:
 	uint32_t m_chunk;
 	uint32_t m_ack_interval;
 	bool m_backto0;
+	uint64_t m_retransmission_timeout_ns;
+	uint32_t m_max_retransmission_retries;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -47,9 +49,11 @@ public:
 	// qp complete callback
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpCompleteCallback;
 	QpCompleteCallback m_qpCompleteCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair>, uint32_t> QpFailureCallback;
+	QpFailureCallback m_qpFailureCallback;
 
 	void SetNode(Ptr<Node> node);
-	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice
+	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
@@ -77,6 +81,9 @@ public:
 
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
+	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
+	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
+	void HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 
 	// call this function after the NIC is setup

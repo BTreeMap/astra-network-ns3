@@ -23,6 +23,7 @@
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/qbb-channel.h"
 //#include "ns3/fivetuple.h"
+#include "ns3/error-model.h"
 #include "ns3/event-id.h"
 #include "ns3/broadcom-egress-queue.h"
 #include "ns3/ipv4.h"
@@ -34,6 +35,13 @@
 #include <ns3/rdma.h>
 
 namespace ns3 {
+
+enum class DataLossScope : uint32_t {
+  All = 0,
+  HostToSwitch,
+  SwitchToHost,
+  SwitchToSwitch,
+};
 
 class RdmaEgressQueue : public Object{
 public:
@@ -132,7 +140,14 @@ public:
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceEnqueue;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDequeue;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDrop;
-	TracedCallback<uint32_t> m_tracePfc; // 0: resume, 1: pause
+  TracedCallback<uint32_t, uint32_t> m_tracePfc; // type, affected queue
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneAttempt;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneDeliver;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceDataPlaneLoss;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceControlPlaneAttempt;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceControlPlaneDeliver;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceQueueEnqueue;
+  TracedCallback<Ptr<const Packet>, uint32_t> m_traceQueueDequeue;
 protected:
 
 	//Ptr<Node> m_node;
@@ -165,6 +180,18 @@ protected:
   bool m_dynamicth;
   uint32_t m_pausetime;	//< Time for each Pause
   bool m_paused[qCnt];	//< Whether a queue paused
+
+  // Data-plane-only impairment. Control packets are deliberately excluded
+  // from this model after their protocol has been classified.
+  Ptr<ErrorModel> m_dataLossErrorModel;
+  uint64_t m_dataLossStartNs;
+  uint64_t m_dataLossDurationNs;
+  uint32_t m_dataLossScope;
+  int32_t m_dataLossSourceHost;
+  int32_t m_dataLossDestinationHost;
+  int32_t m_dataLossReceiverNode;
+
+  bool DataLossScopeMatches(const CustomHeader& ch) const;
 
   //qcn
 

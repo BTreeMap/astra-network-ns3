@@ -12,6 +12,9 @@ TypeId RdmaDriver::GetTypeId (void)
 		.AddTraceSource ("QpComplete", "A qp completes.",
 				MakeTraceSourceAccessor (&RdmaDriver::m_traceQpComplete),
 				"ns3::Packet::TracedCallback")
+		.AddTraceSource ("QpFailure", "A qp reaches an explicit terminal failure.",
+				MakeTraceSourceAccessor (&RdmaDriver::m_traceQpFailure),
+				"ns3::Packet::TracedCallback")
 		;
 	return tid;
 }
@@ -50,7 +53,8 @@ void RdmaDriver::Init(void){
 	#endif
 	// RdmaHw do setup
 	m_rdma->SetNode(m_node);
-	m_rdma->Setup(MakeCallback(&RdmaDriver::QpComplete, this));
+	m_rdma->Setup(MakeCallback(&RdmaDriver::QpComplete, this),
+		MakeCallback(&RdmaDriver::QpFailure, this));
 }
 
 void RdmaDriver::SetNode(Ptr<Node> node){
@@ -67,6 +71,10 @@ void RdmaDriver::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_
 
 void RdmaDriver::QpComplete(Ptr<RdmaQueuePair> q){
 	m_traceQpComplete(q);
+}
+
+void RdmaDriver::QpFailure(Ptr<RdmaQueuePair> q, uint32_t reason){
+	m_traceQpFailure(q, reason);
 }
 
 } // namespace ns3

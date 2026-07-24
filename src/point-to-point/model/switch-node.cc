@@ -40,6 +40,9 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(9000),
 			MakeUintegerAccessor(&SwitchNode::m_maxRtt),
 			MakeUintegerChecker<uint32_t>())
+	.AddTraceSource ("SwitchDrop", "A switch route or admission decision dropped a packet.",
+			MakeTraceSourceAccessor (&SwitchNode::m_traceDrop),
+			"ns3::Packet::TracedCallback")
   ;
   return tid;
 }
@@ -126,6 +129,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 			}else{
+				m_traceDrop(p, 2);
 				return; // Drop
 			}
 			CheckAndSendPfc(inDev, qIndex);
@@ -134,6 +138,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		m_devices[idx]->SwitchSend(qIndex, p, ch);
 	}else
 	{
+		m_traceDrop(p, 1);
 		return; // Drop
 	}
 }
