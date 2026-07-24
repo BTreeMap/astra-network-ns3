@@ -54,6 +54,16 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_backto0),
 				MakeBooleanChecker())
+		.AddAttribute("RetransmissionTimeoutNs",
+				"Zero disables timeout recovery; otherwise retry unacknowledged data after this interval.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_retransmission_timeout_ns),
+				MakeUintegerChecker<uint64_t>())
+		.AddAttribute("MaxRetransmissionRetries",
+				"Number of timeout recoveries allowed before a QP fails explicitly.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_max_retransmission_retries),
+				MakeUintegerChecker<uint32_t>())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -191,7 +201,7 @@ RdmaHw::RdmaHw(){
 void RdmaHw::SetNode(Ptr<Node> node){
 	m_node = node;
 }
-void RdmaHw::Setup(QpCompleteCallback cb){
+void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -207,6 +217,7 @@ void RdmaHw::Setup(QpCompleteCallback cb){
 	}
 	// setup qp complete callback
 	m_qpCompleteCallback = cb;
+	m_qpFailureCallback = failure_cb;
 }
 
 uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
@@ -451,14 +462,19 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
+		const uint64_t acknowledged_before = qp->snd_una;
 		if (!m_backto0){
 			qp->Acknowledge(seq);
 		}else {
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
+		if (qp->snd_una > acknowledged_before)
+			qp->m_timeout_retries = 0;
 		if (qp->IsFinished()){
+			Simulator::Cancel(qp->m_retransmissionTimer);
 			QpComplete(qp);
+			return 0;
 		}
 	}
 	if (ch.l3Prot == 0xFD) // NACK
@@ -481,6 +497,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		HandleAckHpPint(qp, p, ch);
 	}
 	// ACK may advance the on-the-fly window, allowing more packets to send
+	ArmRetransmissionTimeout(qp);
 	dev->TriggerTransmit();
 	//std:://cout << "ack triggere transmitted\n";
 	return 0;
@@ -512,7 +529,7 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			return 5;
 		}
 	} else if (seq > expected) {
-		// Generate NACK
+		// Generate NACK.
 		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected){
 			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
 			q->m_lastNACK = expected;
@@ -520,12 +537,12 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 				q->ReceiverNextExpectedSeq = q->ReceiverNextExpectedSeq / m_chunk*m_chunk;
 			}
 			return 2;
-		}else
-			return 4;
-	}else {
-		// Duplicate.
-		return 3;
+		}
+		return 4;
 	}
+	// A duplicate usually means that the sender did not observe a previous
+	// ACK. Repeat the cumulative ACK so timeout recovery can terminate.
+	return 1;
 }
 void RdmaHw::AddHeader (Ptr<Packet> p, uint16_t protocolNumber){
 	PppHeader ppp;
@@ -542,11 +559,46 @@ uint16_t RdmaHw::EtherToPpp (uint16_t proto){
 }
 
 void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFailed())
+		return;
+	qp->m_recovery_events++;
 	qp->snd_nxt = qp->snd_una;
+}
+
+void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
+	if (m_retransmission_timeout_ns == 0 || qp->IsFinished() || qp->IsFailed())
+		return;
+	if (!qp->m_retransmissionTimer.IsExpired())
+		Simulator::Cancel(qp->m_retransmissionTimer);
+	if (qp->snd_una >= qp->snd_nxt)
+		return;
+	qp->m_retransmissionTimer = Simulator::Schedule(
+		NanoSeconds(m_retransmission_timeout_ns),
+		&RdmaHw::HandleRetransmissionTimeout, this, qp);
+}
+
+void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFinished() || qp->IsFailed())
+		return;
+	if (qp->snd_una >= qp->snd_nxt)
+		return;
+	const Ptr<RdmaQueuePair> active = GetQp(qp->dip.Get(), qp->sport, qp->m_pg);
+	if (active != qp)
+		return;
+	if (qp->m_timeout_retries >= m_max_retransmission_retries){
+		QpFail(qp, 1);
+		return;
+	}
+	qp->m_timeout_retries++;
+	RecoverQueue(qp);
+	const uint32_t nic_idx = GetNicIdxOfQp(qp);
+	m_nic[nic_idx].dev->TriggerTransmit();
+	ArmRetransmissionTimeout(qp);
 }
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	Simulator::Cancel(qp->m_retransmissionTimer);
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -560,6 +612,22 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	qp->m_notifyAppFinish();
 
 	// delete the qp
+	DeleteQueuePair(qp);
+}
+
+void RdmaHw::QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason){
+	if (qp->IsFinished() || qp->IsFailed())
+		return;
+	NS_ASSERT(!m_qpFailureCallback.IsNull());
+	qp->m_failed = true;
+	qp->m_failure_reason = reason;
+	Simulator::Cancel(qp->m_retransmissionTimer);
+	if (m_cc_mode == 1){
+		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
+		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
+		Simulator::Cancel(qp->mlx.m_rpTimer);
+	}
+	m_qpFailureCallback(qp, reason);
 	DeleteQueuePair(qp);
 }
 
@@ -595,6 +663,8 @@ void RdmaHw::RedistributeQp(){
 }
 
 Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
+	if (qp->IsFailed())
+		return 0;
 	uint32_t payload_size = qp->GetBytesLeft();
 	if (m_mtu < payload_size)
 		payload_size = m_mtu;
@@ -624,6 +694,14 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
 	p->AddHeader (ppp);
 
+	// Account payload attempts independently from the original QP size so
+	// go-back-N work is visible at both success and failure terminal states.
+	if (qp->snd_nxt < qp->m_highest_sent)
+		qp->m_retransmitted_bytes += payload_size;
+	else
+		qp->m_highest_sent = qp->snd_nxt + payload_size;
+	qp->m_data_attempted_bytes += payload_size;
+
 	// update state
 	qp->snd_nxt += payload_size;
 	qp->m_ipid++;
@@ -635,6 +713,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){
 	qp->lastPktSize = pkt->GetSize();
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
+	ArmRetransmissionTimeout(qp);
 }
 
 void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size){

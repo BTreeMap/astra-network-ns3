@@ -21,6 +21,7 @@
 #include "ns3/core-module.h"
 #include "ns3/error-model.h"
 #include "ns3/global-route-manager.h"
+#include "ns3/integer.h"
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-static-routing-helper.h"
 #include "ns3/packet.h"
@@ -28,6 +29,8 @@
 #include "ns3/qbb-helper.h"
 #include <fstream>
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -49,6 +52,7 @@ double pause_time = 5, simulator_stop_time = 3.01;
 std::string topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
+std::string transport_event_output_file = "transport_events.csv";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -58,6 +62,14 @@ std::string dctcp_rate_ai = "1000Mb/s";
 
 bool clamp_target_rate = false, l2_back_to_zero = false;
 double error_rate_per_link = 0.0;
+double data_loss_probability = 0.0;
+uint64_t data_loss_start_ns = 0, data_loss_duration_ns = 0;
+std::string data_loss_scope = "all";
+int32_t data_loss_source_host = -1, data_loss_destination_host = -1;
+int32_t data_loss_receiver_node = -1;
+uint64_t data_loss_rng_stream = 51;
+uint64_t retransmission_timeout_ns = 0;
+uint32_t max_retransmission_retries = 0;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -137,10 +149,126 @@ Ipv4Address node_id_to_ip(uint32_t id) {
 
 uint32_t ip_to_node_id(Ipv4Address ip) { return (ip.Get() >> 8) & 0xffff; }
 
-void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type) {
-  fprintf(fout, "%lu %u %u %u %u\n", Simulator::Now().GetTimeStep(),
+void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type,
+             uint32_t queue) {
+  fprintf(fout, "%lu %u %u %u %u %u\n", Simulator::Now().GetTimeStep(),
           dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
-          dev->GetIfIndex(), type);
+          dev->GetIfIndex(), queue, type);
+}
+
+void write_transport_event(FILE *fout, const char *event,
+                           Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
+                           uint32_t protocol, int32_t queue) {
+  CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                  CustomHeader::L4_Header);
+  ch.getInt = 1;
+  packet->PeekHeader(ch);
+  uint16_t source_port = 0;
+  if (protocol == 0x11)
+    source_port = ch.udp.sport;
+  else if (protocol == 0xFC || protocol == 0xFD)
+    source_port = ch.ack.sport;
+  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
+  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
+  fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
+          Simulator::Now().GetNanoSeconds(), event,
+          protocol == 0x11 ? "data" : "control", protocol,
+          dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
+          dev->GetIfIndex(), source_host, destination_host, source_port,
+          packet->GetSize(), queue);
+  fflush(fout);
+}
+
+void get_transport_event(FILE *fout, const char *event,
+                         Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
+                         uint32_t protocol) {
+  write_transport_event(fout, event, dev, packet, protocol, -1);
+}
+
+void get_queue_event(FILE *fout, const char *event, Ptr<QbbNetDevice> dev,
+                     Ptr<const Packet> packet, uint32_t queue) {
+  CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                  CustomHeader::L4_Header);
+  ch.getInt = 1;
+  packet->PeekHeader(ch);
+  write_transport_event(fout, event, dev, packet, ch.l3Prot,
+                        static_cast<int32_t>(queue));
+}
+
+void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
+                     Ptr<const Packet> packet, uint32_t reason) {
+  CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                  CustomHeader::L4_Header);
+  ch.getInt = 1;
+  packet->PeekHeader(ch);
+  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
+  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
+  const uint16_t source_port = ch.l3Prot == 0x11 ? ch.udp.sport : 0;
+  fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,-1\n",
+          Simulator::Now().GetNanoSeconds(),
+          reason == 1 ? "switch_route_drop" : "switch_admission_drop",
+          ch.l3Prot == 0x11 ? "data" : "control", ch.l3Prot,
+          sw->GetId(), sw->GetNodeType(), source_host, destination_host,
+          source_port, packet->GetSize());
+  fflush(fout);
+}
+
+uint32_t data_loss_scope_value() {
+  if (data_loss_scope == "all")
+    return static_cast<uint32_t>(DataLossScope::All);
+  if (data_loss_scope == "host_to_switch")
+    return static_cast<uint32_t>(DataLossScope::HostToSwitch);
+  if (data_loss_scope == "switch_to_host")
+    return static_cast<uint32_t>(DataLossScope::SwitchToHost);
+  if (data_loss_scope == "switch_to_switch")
+    return static_cast<uint32_t>(DataLossScope::SwitchToSwitch);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
+  dev->SetAttribute("DataLossStartNs", UintegerValue(data_loss_start_ns));
+  dev->SetAttribute("DataLossDurationNs", UintegerValue(data_loss_duration_ns));
+  dev->SetAttribute("DataLossScope", UintegerValue(data_loss_scope_value()));
+  dev->SetAttribute("DataLossSourceHost", IntegerValue(data_loss_source_host));
+  dev->SetAttribute("DataLossDestinationHost",
+                    IntegerValue(data_loss_destination_host));
+  dev->SetAttribute("DataLossReceiverNode", IntegerValue(data_loss_receiver_node));
+  if (data_loss_duration_ns == 0)
+    return;
+  Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
+  Ptr<UniformRandomVariable> random = CreateObject<UniformRandomVariable>();
+  model->SetRandomVariable(random);
+  random->SetStream(static_cast<int64_t>(data_loss_rng_stream + stream_offset));
+  model->SetAttribute("ErrorRate", DoubleValue(data_loss_probability));
+  model->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+  dev->SetAttribute("DataLossErrorModel", PointerValue(model));
+}
+
+void connect_transport_traces(FILE *fout, Ptr<QbbNetDevice> dev) {
+  dev->TraceConnectWithoutContext(
+      "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+                                              "data_arrival", dev));
+  dev->TraceConnectWithoutContext(
+      "DataPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+                                              "data_deliver", dev));
+  dev->TraceConnectWithoutContext(
+      "DataPlaneLoss", MakeBoundCallback(&get_transport_event, fout,
+                                           "data_injected_drop", dev));
+  dev->TraceConnectWithoutContext(
+      "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+                                                 "control_arrival", dev));
+  dev->TraceConnectWithoutContext(
+      "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+                                                 "control_deliver", dev));
+  dev->TraceConnectWithoutContext(
+        "QueueEnqueue", MakeBoundCallback(&get_queue_event, fout,
+                          "queue_enqueue", dev));
+  dev->TraceConnectWithoutContext(
+        "QueueDequeue", MakeBoundCallback(&get_queue_event, fout,
+                          "queue_dequeue", dev));
+  dev->TraceConnectWithoutContext(
+        "QbbDrop", MakeBoundCallback(&get_queue_event, fout,
+                      "qbb_drop", dev));
 }
 
 struct QlenDistribution {
@@ -423,6 +551,26 @@ bool ReadConf(string network_configuration) {
       double v;
       conf >> v;
       error_rate_per_link = v;
+    } else if (key.compare("DATA_LOSS_PROBABILITY") == 0) {
+      conf >> data_loss_probability;
+    } else if (key.compare("DATA_LOSS_START_NS") == 0) {
+      conf >> data_loss_start_ns;
+    } else if (key.compare("DATA_LOSS_DURATION_NS") == 0) {
+      conf >> data_loss_duration_ns;
+    } else if (key.compare("DATA_LOSS_SCOPE") == 0) {
+      conf >> data_loss_scope;
+    } else if (key.compare("DATA_LOSS_SOURCE_HOST") == 0) {
+      conf >> data_loss_source_host;
+    } else if (key.compare("DATA_LOSS_DESTINATION_HOST") == 0) {
+      conf >> data_loss_destination_host;
+    } else if (key.compare("DATA_LOSS_RECEIVER_NODE") == 0) {
+      conf >> data_loss_receiver_node;
+    } else if (key.compare("DATA_LOSS_RNG_STREAM") == 0) {
+      conf >> data_loss_rng_stream;
+    } else if (key.compare("RETRANSMISSION_TIMEOUT_NS") == 0) {
+      conf >> retransmission_timeout_ns;
+    } else if (key.compare("MAX_RETRANSMISSION_RETRIES") == 0) {
+      conf >> max_retransmission_retries;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -463,6 +611,8 @@ bool ReadConf(string network_configuration) {
       conf >> nic_total_pause_time;
     } else if (key.compare("PFC_OUTPUT_FILE") == 0) {
       conf >> pfc_output_file;
+    } else if (key.compare("TRANSPORT_EVENT_OUTPUT_FILE") == 0) {
+      conf >> transport_event_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("ENABLE_TRACE") == 0) {
@@ -523,6 +673,33 @@ bool ReadConf(string network_configuration) {
     fflush(stdout);
   }
   conf.close();
+  if (error_rate_per_link != 0.0) {
+    std::cerr << "ERROR_RATE_PER_LINK is unsupported; use DATA_LOSS_* controls\n";
+    return false;
+  }
+  if (!std::isfinite(data_loss_probability) || data_loss_probability < 0.0 ||
+      data_loss_probability > 1.0) {
+    std::cerr << "DATA_LOSS_PROBABILITY must be in [0, 1]\n";
+    return false;
+  }
+  if (data_loss_scope_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "DATA_LOSS_SCOPE must be all, host_to_switch, switch_to_host, or switch_to_switch\n";
+    return false;
+  }
+  if (data_loss_duration_ns == 0 && data_loss_probability != 0.0) {
+    std::cerr << "DATA_LOSS_DURATION_NS must be nonzero when loss probability is nonzero\n";
+    return false;
+  }
+  if (data_loss_duration_ns != 0 &&
+      (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
+    std::cerr << "loss experiments require retransmission timeout and retry budget\n";
+    return false;
+  }
+  if (data_loss_rng_stream >
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
+    return false;
+  }
   return true;
 }
 
@@ -555,7 +732,8 @@ void SetConfig() {
   }
 }
 
-bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
+bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
+                  void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t)) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -613,14 +791,24 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
   NS_LOG_INFO("Create channels.");
 
-  Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
-  Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
-  rem->SetRandomVariable(uv);
-  uv->SetStream(50);
-  rem->SetAttribute("ErrorRate", DoubleValue(error_rate_per_link));
-  rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
-
   FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
+  FILE *transport_event_file = fopen(transport_event_output_file.c_str(), "w");
+  if (pfc_file == nullptr || transport_event_file == nullptr) {
+    std::cerr << "Error: cannot open PFC or transport event output file\n";
+    return false;
+  }
+  fprintf(transport_event_file,
+          "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
+      "destination_host,source_port,packet_bytes,queue\n");
+  for (uint32_t i = 0; i < node_num; i++) {
+    if (n.Get(i)->GetNodeType() == 1) {
+      Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
+      sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
+      sw->TraceConnectWithoutContext(
+          "SwitchDrop", MakeBoundCallback(&get_switch_drop,
+                                            transport_event_file, sw));
+    }
+  }
 
   QbbHelper qbb;
   Ipv4AddressHelper ipv4;
@@ -629,22 +817,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     std::string data_rate, link_delay;
     double error_rate;
     topof >> src >> dst >> data_rate >> link_delay >> error_rate;
+    if (error_rate != 0.0) {
+      std::cerr << "Topology link error rates are unsupported; use DATA_LOSS_* controls\n";
+      return false;
+    }
     Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
 
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
     qbb.SetChannelAttribute("Delay", StringValue(link_delay));
-
-    if (error_rate > 0) {
-      Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
-      Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
-      rem->SetRandomVariable(uv);
-      uv->SetStream(50);
-      rem->SetAttribute("ErrorRate", DoubleValue(error_rate));
-      rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
-      qbb.SetDeviceAttribute("ReceiveErrorModel", PointerValue(rem));
-    } else {
-      qbb.SetDeviceAttribute("ReceiveErrorModel", PointerValue(rem));
-    }
 
     fflush(stdout);
 
@@ -653,6 +833,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     // (ipv4.Assign(d)), because we want our IP to be the primary IP (first in
     // the IP address list), so that the global routing is based on our IP
     NetDeviceContainer d = qbb.Install(snode, dnode);
+    Ptr<QbbNetDevice> src_dev = DynamicCast<QbbNetDevice>(d.Get(0));
+    Ptr<QbbNetDevice> dst_dev = DynamicCast<QbbNetDevice>(d.Get(1));
+    configure_data_loss(src_dev, static_cast<uint64_t>(i) * 2);
+    configure_data_loss(dst_dev, static_cast<uint64_t>(i) * 2 + 1);
+    connect_transport_traces(transport_event_file, src_dev);
+    connect_transport_traces(transport_event_file, dst_dev);
     if (snode->GetNodeType() == 0) {
       Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
       ipv4->AddInterface(d.Get(0));
@@ -697,12 +883,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     ipv4.Assign(d);
 
     // setup PFC trace
-    DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext(
+    src_dev->TraceConnectWithoutContext(
         "QbbPfc", MakeBoundCallback(&get_pfc, pfc_file,
-                                    DynamicCast<QbbNetDevice>(d.Get(0))));
-    DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext(
+                    src_dev));
+    dst_dev->TraceConnectWithoutContext(
         "QbbPfc", MakeBoundCallback(&get_pfc, pfc_file,
-                                    DynamicCast<QbbNetDevice>(d.Get(1))));
+                    dst_dev));
   }
 
   nic_rate = get_nic_rate(n);
@@ -747,6 +933,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
+  if (fct_output == nullptr) {
+    std::cerr << "Error: cannot open FCT output file\n";
+    return false;
+  }
   std::cout << "QP is enabled " << std::endl;
   //
   // install RDMA driver
@@ -767,6 +957,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));
       rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));
       rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));
+      rdmaHw->SetAttribute("RetransmissionTimeoutNs",
+               UintegerValue(retransmission_timeout_ns));
+      rdmaHw->SetAttribute("MaxRetransmissionRetries",
+               UintegerValue(max_retransmission_retries));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
@@ -794,6 +988,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       rdma->Init();
       rdma->TraceConnectWithoutContext(
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
+        rdma->TraceConnectWithoutContext(
+          "QpFailure", MakeBoundCallback(qp_fail, fct_output));
     }
   }
 #endif

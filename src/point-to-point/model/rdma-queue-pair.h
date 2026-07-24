@@ -20,6 +20,14 @@ public:
 	uint64_t m_size, m_init_size, m_tag;
 	uint32_t m_src, m_dest;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
+	uint64_t m_highest_sent;
+	uint64_t m_data_attempted_bytes;
+	uint64_t m_retransmitted_bytes;
+	uint32_t m_recovery_events;
+	uint32_t m_timeout_retries;
+	uint32_t m_failure_reason;
+	bool m_failed;
+	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
@@ -105,6 +113,7 @@ public:
 	bool IsWinBound();
 	uint64_t GetWin(); // window size calculated from m_rate
 	bool IsFinished();
+	bool IsFailed();
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 };
 

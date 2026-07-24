@@ -32,6 +32,13 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_dest = -1;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;
+	m_highest_sent = 0;
+	m_data_attempted_bytes = 0;
+	m_retransmitted_bytes = 0;
+	m_recovery_events = 0;
+	m_timeout_retries = 0;
+	m_failure_reason = 0;
+	m_failed = false;
 	m_pg = pg;
 	m_ipid = 0;
 	m_win = 0;
@@ -192,7 +199,11 @@ uint64_t RdmaQueuePair::HpGetCurWin(){
 }
 
 bool RdmaQueuePair::IsFinished(){
-	return snd_una >= m_size;
+	return !m_failed && snd_una >= m_size;
+}
+
+bool RdmaQueuePair::IsFailed(){
+	return m_failed;
 }
 
 /*********************

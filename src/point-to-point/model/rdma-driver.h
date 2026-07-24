@@ -18,6 +18,7 @@ public:
 
 	// trace
 	TracedCallback<Ptr<RdmaQueuePair> > m_traceQpComplete;
+	TracedCallback<Ptr<RdmaQueuePair>, uint32_t> m_traceQpFailure;
 
 	static TypeId GetTypeId (void);
 	RdmaDriver();
@@ -37,6 +38,7 @@ public:
 
 	// callback when qp completes
 	void QpComplete(Ptr<RdmaQueuePair> q);
+	void QpFailure(Ptr<RdmaQueuePair> q, uint32_t reason);
 };
 
 } // namespace ns3
