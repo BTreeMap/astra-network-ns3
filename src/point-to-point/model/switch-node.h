@@ -11,6 +11,12 @@ namespace ns3 {
 
 class Packet;
 
+enum class SwitchDropReason : uint32_t {
+	Route = 1,
+	Admission = 2,
+	EgressQueue = 3,
+};
+
 class SwitchNode : public Node{
 	static const uint32_t pCnt = 1025;	// Number of ports used
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used

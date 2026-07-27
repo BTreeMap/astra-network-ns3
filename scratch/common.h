@@ -204,9 +204,20 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
   const uint16_t source_port = ch.l3Prot == 0x11 ? ch.udp.sport : 0;
+  const char *event = "switch_unknown_drop";
+  switch (static_cast<SwitchDropReason>(reason)) {
+  case SwitchDropReason::Route:
+    event = "switch_route_drop";
+    break;
+  case SwitchDropReason::Admission:
+    event = "switch_admission_drop";
+    break;
+  case SwitchDropReason::EgressQueue:
+    event = "switch_egress_queue_drop";
+    break;
+  }
   fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,-1\n",
-          Simulator::Now().GetNanoSeconds(),
-          reason == 1 ? "switch_route_drop" : "switch_admission_drop",
+          Simulator::Now().GetNanoSeconds(), event,
           ch.l3Prot == 0x11 ? "data" : "control", ch.l3Prot,
           sw->GetId(), sw->GetNodeType(), source_host, destination_host,
           source_port, packet->GetSize());

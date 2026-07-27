@@ -129,16 +129,24 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 			}else{
-				m_traceDrop(p, 2);
+				m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::Admission));
 				return; // Drop
 			}
 			CheckAndSendPfc(inDev, qIndex);
 		}
 		m_bytes[inDev][idx][qIndex] += p->GetSize();
-		m_devices[idx]->SwitchSend(qIndex, p, ch);
+		if (!m_devices[idx]->SwitchSend(qIndex, p, ch)){
+			m_bytes[inDev][idx][qIndex] -= p->GetSize();
+			if (qIndex != 0){
+				m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
+				m_mmu->RemoveFromEgressAdmission(idx, qIndex, p->GetSize());
+				CheckAndSendResume(inDev, qIndex);
+			}
+			m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::EgressQueue));
+		}
 	}else
 	{
-		m_traceDrop(p, 1);
+		m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::Route));
 		return; // Drop
 	}
 }

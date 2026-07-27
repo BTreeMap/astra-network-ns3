@@ -515,12 +515,12 @@ namespace ns3 {
 
 	bool QbbNetDevice::SwitchSend (uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch){
 		m_macTxTrace(packet);
-		m_traceEnqueue(packet, qIndex);
-		m_traceQueueEnqueue(packet, qIndex);
 		if (!m_queue->Enqueue(packet, qIndex)) {
 			m_traceDrop(packet, qIndex);
 			return false;
 		}
+		m_traceEnqueue(packet, qIndex);
+		m_traceQueueEnqueue(packet, qIndex);
 		DequeueAndTransmit();
 		return true;
 	}
