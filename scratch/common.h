@@ -256,30 +256,25 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
 }
 
 void connect_transport_traces(FILE *fout, Ptr<QbbNetDevice> dev) {
+  if (data_loss_duration_ns != 0) {
+    dev->TraceConnectWithoutContext(
+        "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+                                                "data_arrival", dev));
+    dev->TraceConnectWithoutContext(
+        "DataPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+                                                "data_deliver", dev));
+    dev->TraceConnectWithoutContext(
+        "DataPlaneLoss", MakeBoundCallback(&get_transport_event, fout,
+                                             "data_injected_drop", dev));
+    dev->TraceConnectWithoutContext(
+        "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+                                                   "control_arrival", dev));
+    dev->TraceConnectWithoutContext(
+        "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+                                                   "control_deliver", dev));
+  }
   dev->TraceConnectWithoutContext(
-      "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
-                                              "data_arrival", dev));
-  dev->TraceConnectWithoutContext(
-      "DataPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
-                                              "data_deliver", dev));
-  dev->TraceConnectWithoutContext(
-      "DataPlaneLoss", MakeBoundCallback(&get_transport_event, fout,
-                                           "data_injected_drop", dev));
-  dev->TraceConnectWithoutContext(
-      "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
-                                                 "control_arrival", dev));
-  dev->TraceConnectWithoutContext(
-      "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
-                                                 "control_deliver", dev));
-  dev->TraceConnectWithoutContext(
-        "QueueEnqueue", MakeBoundCallback(&get_queue_event, fout,
-                          "queue_enqueue", dev));
-  dev->TraceConnectWithoutContext(
-        "QueueDequeue", MakeBoundCallback(&get_queue_event, fout,
-                          "queue_dequeue", dev));
-  dev->TraceConnectWithoutContext(
-        "QbbDrop", MakeBoundCallback(&get_queue_event, fout,
-                      "qbb_drop", dev));
+      "QbbDrop", MakeBoundCallback(&get_queue_event, fout, "qbb_drop", dev));
 }
 
 struct QlenDistribution {
@@ -337,8 +332,8 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
         //	queue_result[i][j]+=size;
         // queue_result[i][j].add(size);
       }
-      fflush(qlen_output);
-      // fprintf(qlen_output, "\n");
+      // Flush once after the complete sample. Flushing each switch at a
+      // packet-scale cadence can dominate high-rate simulations.
     }
   }
   fflush(qlen_output);
@@ -661,6 +656,8 @@ bool ReadConf(string network_configuration) {
       conf >> qlen_mon_file;
     } else if (key.compare("QLEN_MON_START") == 0) {
       conf >> qlen_mon_start;
+    } else if (key.compare("QLEN_MON_INTERVAL") == 0) {
+      conf >> qlen_mon_interval;
     } else if (key.compare("QLEN_MON_END") == 0) {
       conf >> qlen_mon_end;
     } else if (key.compare("MULTI_RATE") == 0) {
@@ -709,6 +706,10 @@ bool ReadConf(string network_configuration) {
   if (data_loss_rng_stream >
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
+    return false;
+  }
+  if (qlen_mon_interval == 0) {
+    std::cerr << "QLEN_MON_INTERVAL must be positive\n";
     return false;
   }
   return true;
