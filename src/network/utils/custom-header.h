@@ -25,6 +25,9 @@
 #include "ns3/int-header.h"
 
 namespace ns3 {
+
+constexpr uint8_t kUecTrimRepairProtocol = 0xFA;
+constexpr uint8_t kUecTrimNotificationProtocol = 0xFB;
 /**
  * \ingroup ipv4
  *
@@ -123,6 +126,7 @@ public:
 		  uint16_t flags;
 		  uint16_t pg;
 		  uint32_t seq; // the qbb sequence number.
+      uint32_t trim_payload_size;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader

@@ -60,7 +60,7 @@ TypeId RdmaHw::GetTypeId (void)
 				MakeUintegerAccessor(&RdmaHw::m_retransmission_timeout_ns),
 				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("MaxRetransmissionRetries",
-				"Number of timeout recoveries allowed before a QP fails explicitly.",
+				"Number of bounded recovery attempts allowed before a QP fails explicitly.",
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_max_retransmission_retries),
 				MakeUintegerChecker<uint32_t>())
@@ -470,7 +470,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			qp->Acknowledge(goback_seq);
 		}
 		if (qp->snd_una > acknowledged_before)
-			qp->m_timeout_retries = 0;
+			qp->m_recovery_retries = 0;
 		if (qp->IsFinished()){
 			Simulator::Cancel(qp->m_retransmissionTimer);
 			QpComplete(qp);
@@ -506,6 +506,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 	if (ch.l3Prot == 0x11){ // UDP
 		ReceiveUdp(p, ch);
+	}else if (ch.l3Prot == kUecTrimNotificationProtocol ||
+			ch.l3Prot == kUecTrimRepairProtocol){
+		ReceiveTrim(p, ch);
 	}else if (ch.l3Prot == 0xFF){ // CNP
 		ReceiveCnp(p, ch);
 	}else if (ch.l3Prot == 0xFD){ // NACK
@@ -513,6 +516,87 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 	}else if (ch.l3Prot == 0xFC){ // ACK
 		ReceiveAck(p, ch);
 	}
+	return 0;
+}
+
+void RdmaHw::SendTrimRepair(const CustomHeader &ch){
+	qbbHeader repair;
+	repair.SetSeq(ch.ack.seq);
+	repair.SetPG(ch.ack.pg);
+	repair.SetSport(ch.ack.sport);
+	repair.SetDport(ch.ack.dport);
+	repair.SetTrimPayloadSize(ch.ack.trim_payload_size);
+	repair.SetTrimFtd(true);
+	repair.SetIntHeader(ch.ack.ih);
+	Ptr<Packet> packet = Create<Packet>(
+		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
+	packet->AddHeader(repair);
+
+	Ipv4Header ipHeader;
+	ipHeader.SetSource(Ipv4Address(ch.dip));
+	ipHeader.SetDestination(Ipv4Address(ch.sip));
+	ipHeader.SetProtocol(kUecTrimRepairProtocol);
+	ipHeader.SetPayloadSize(packet->GetSize());
+	ipHeader.SetTtl(64);
+	ipHeader.SetIdentification(ch.ipid);
+	packet->AddHeader(ipHeader);
+	AddHeader(packet, 0x800);
+
+	auto route = m_rtTable.find(ch.sip);
+	if (route == m_rtTable.end() || route->second.empty()) {
+		return;
+	}
+	const uint32_t nicIdx = route->second[0];
+	m_nic[nicIdx].dev->RdmaEnqueueHighPrioQ(packet);
+	m_nic[nicIdx].dev->TriggerTransmit();
+}
+
+void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
+		const CustomHeader &ch, bool isFtdRepair){
+	const uint64_t trimStart = ch.ack.seq;
+	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
+	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
+		qp->m_stale_trim_notifications++;
+		return;
+	}
+	if (qp->m_recovery_retries >= m_max_retransmission_retries){
+		QpFail(qp, static_cast<uint32_t>(RdmaFailureReason::TrimRetryExhausted));
+		return;
+	}
+
+	qp->m_recovery_retries++;
+	qp->m_trim_notifications++;
+	qp->m_trimmed_payload_bytes += ch.ack.trim_payload_size;
+	if (isFtdRepair) {
+		qp->m_trim_ftd_repairs++;
+	} else {
+		qp->m_trim_bts_notifications++;
+	}
+	qp->m_trim_recovery_events++;
+	if (m_cc_mode == 1) {
+		cnp_received_mlx(qp);
+	}
+	RecoverQueue(qp);
+	const uint32_t nicIdx = GetNicIdxOfQp(qp);
+	m_nic[nicIdx].dev->TriggerTransmit();
+	ArmRetransmissionTimeout(qp);
+}
+
+int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
+	(void)p;
+	if (ch.l3Prot == kUecTrimNotificationProtocol &&
+		((ch.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1)){
+		// The destination received loss metadata, not payload. It asks the
+		// sender to repair without changing ReceiverNextExpectedSeq.
+		SendTrimRepair(ch);
+		return 0;
+	}
+
+	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.sport, ch.ack.pg);
+	if (!qp || qp->IsFailed()) {
+		return 0;
+	}
+	RecoverTrimmedQueue(qp, ch, ch.l3Prot == kUecTrimRepairProtocol);
 	return 0;
 }
 
@@ -585,11 +669,11 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	const Ptr<RdmaQueuePair> active = GetQp(qp->dip.Get(), qp->sport, qp->m_pg);
 	if (active != qp)
 		return;
-	if (qp->m_timeout_retries >= m_max_retransmission_retries){
-		QpFail(qp, 1);
+	if (qp->m_recovery_retries >= m_max_retransmission_retries){
+		QpFail(qp, static_cast<uint32_t>(RdmaFailureReason::TimeoutRetryExhausted));
 		return;
 	}
-	qp->m_timeout_retries++;
+	qp->m_recovery_retries++;
 	RecoverQueue(qp);
 	const uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].dev->TriggerTransmit();

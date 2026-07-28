@@ -8,6 +8,7 @@
 #include "ns3/double.h"
 #include "switch-node.h"
 #include "qbb-net-device.h"
+#include "qbb-header.h"
 #include "ppp-header.h"
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
@@ -35,6 +36,13 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(0),
 			MakeUintegerAccessor(&SwitchNode::m_ackHighPrio),
 			MakeUintegerChecker<uint32_t>())
+	.AddAttribute("PacketTrimMode",
+			"0=disabled, 1=forward trimmed metadata to the destination, 2=return it to the sender.",
+			UintegerValue(static_cast<uint32_t>(PacketTrimMode::Disabled)),
+			MakeUintegerAccessor(&SwitchNode::m_packetTrimMode),
+			MakeUintegerChecker<uint32_t>(
+				static_cast<uint32_t>(PacketTrimMode::Disabled),
+				static_cast<uint32_t>(PacketTrimMode::BackToSender)))
 	.AddAttribute("MaxRtt",
 			"Max Rtt of the network",
 			UintegerValue(9000),
@@ -43,6 +51,9 @@ TypeId SwitchNode::GetTypeId (void)
 	.AddTraceSource ("SwitchDrop", "A switch route or admission decision dropped a packet.",
 			MakeTraceSourceAccessor (&SwitchNode::m_traceDrop),
 			"ns3::Packet::TracedCallback")
+	.AddTraceSource ("PacketTrim", "A congested switch converted RDMA data into trim metadata.",
+			MakeTraceSourceAccessor (&SwitchNode::m_traceTrim),
+			"ns3::Packet::TracedCallback")
   ;
   return tid;
 }
@@ -50,6 +61,7 @@ TypeId SwitchNode::GetTypeId (void)
 SwitchNode::SwitchNode(){
 	m_ecmpSeed = m_id;
 	m_node_type = 1;
+	m_packetTrimMode = static_cast<uint32_t>(PacketTrimMode::Disabled);
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
 		for (uint32_t j = 0; j < pCnt; j++)
@@ -85,11 +97,67 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		buf.u32[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
 	else if (ch.l3Prot == 0x11)
 		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
-	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
+	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD ||
+			 ch.l3Prot == kUecTrimRepairProtocol ||
+			 ch.l3Prot == kUecTrimNotificationProtocol)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
 	return nexthops[idx];
+}
+
+bool SwitchNode::PacketTrimEnabledFor(const CustomHeader &ch) const{
+	return m_packetTrimMode != static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+		ch.l3Prot == 0x11;
+}
+
+bool SwitchNode::SendTrimNotification(const CustomHeader &ch, uint32_t payloadSize,
+		PacketTrimTrigger trigger){
+	const PacketTrimMode mode = static_cast<PacketTrimMode>(m_packetTrimMode);
+	const bool forwardToDestination = mode == PacketTrimMode::ForwardToDestination;
+	if (mode != PacketTrimMode::ForwardToDestination &&
+		mode != PacketTrimMode::BackToSender){
+		return false;
+	}
+
+	qbbHeader trimHeader;
+	trimHeader.SetSeq(ch.udp.seq);
+	trimHeader.SetPG(ch.udp.pg);
+	// Trim control keeps the original flow identity independent of its return
+	// direction, so the sender can find the QP without treating it as data.
+	trimHeader.SetSport(ch.udp.sport);
+	trimHeader.SetDport(ch.udp.dport);
+	trimHeader.SetTrimPayloadSize(payloadSize);
+	trimHeader.SetTrimFtd(forwardToDestination);
+	trimHeader.SetIntHeader(ch.udp.ih);
+
+	Ptr<Packet> trimPacket = Create<Packet>(
+		std::max(60 - 14 - 20 - static_cast<int>(trimHeader.GetSerializedSize()), 0));
+	trimPacket->AddHeader(trimHeader);
+
+	Ipv4Header ipHeader;
+	ipHeader.SetSource(Ipv4Address(forwardToDestination ? ch.sip : ch.dip));
+	ipHeader.SetDestination(Ipv4Address(forwardToDestination ? ch.dip : ch.sip));
+	ipHeader.SetProtocol(kUecTrimNotificationProtocol);
+	ipHeader.SetPayloadSize(trimPacket->GetSize());
+	ipHeader.SetTtl(64);
+	ipHeader.SetIdentification(ch.ipid);
+	trimPacket->AddHeader(ipHeader);
+	PppHeader ppp;
+	ppp.SetProtocol(0x0021);
+	trimPacket->AddHeader(ppp);
+
+	CustomHeader trimCh(CustomHeader::L2_Header | CustomHeader::L3_Header |
+		CustomHeader::L4_Header);
+	trimCh.getInt = 1;
+	trimPacket->PeekHeader(trimCh);
+	const int trimOutDev = GetOutDev(trimPacket, trimCh);
+	if (trimOutDev < 0)
+		return false;
+	if (!m_devices[trimOutDev]->SwitchSend(0, trimPacket, trimCh))
+		return false;
+	m_traceTrim(trimPacket, static_cast<uint32_t>(trigger));
+	return true;
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
@@ -114,7 +182,10 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 
 		// determine the qIndex
 		uint32_t qIndex;
-		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE || (m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))){  //QCN or PFC or NACK, go highest priority
+		if (ch.l3Prot == 0xFF || ch.l3Prot == 0xFE ||
+			ch.l3Prot == kUecTrimRepairProtocol ||
+			ch.l3Prot == kUecTrimNotificationProtocol ||
+			(m_ackHighPrio && (ch.l3Prot == 0xFD || ch.l3Prot == 0xFC))){  //QCN or PFC or NACK, go highest priority
 			qIndex = 0;
 		}else{
 			qIndex = (ch.l3Prot == 0x06 ? 1 : ch.udp.pg); // if TCP, put to queue 1
@@ -129,6 +200,17 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 			}else{
+				const uint32_t dataHeaderBytes = ch.GetSerializedSize();
+				if (p->GetSize() <= dataHeaderBytes) {
+					m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::Admission));
+					return;
+				}
+				if (PacketTrimEnabledFor(ch) &&
+					SendTrimNotification(ch,
+						p->GetSize() - dataHeaderBytes,
+						PacketTrimTrigger::Admission)){
+					return;
+				}
 				m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::Admission));
 				return; // Drop
 			}
@@ -141,6 +223,17 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 				m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->RemoveFromEgressAdmission(idx, qIndex, p->GetSize());
 				CheckAndSendResume(inDev, qIndex);
+			}
+			if (PacketTrimEnabledFor(ch)) {
+				const uint32_t dataHeaderBytes = ch.GetSerializedSize();
+				if (p->GetSize() <= dataHeaderBytes) {
+					m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::EgressQueue));
+					return;
+				}
+				if (SendTrimNotification(ch, p->GetSize() - dataHeaderBytes,
+						PacketTrimTrigger::EgressQueue)) {
+					return;
+				}
 			}
 			m_traceDrop(p, static_cast<uint32_t>(SwitchDropReason::EgressQueue));
 		}

@@ -27,6 +27,7 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
+#include "ns3/qbb-header.h"
 #include <fstream>
 #include <iostream>
 #include <cmath>
@@ -70,6 +71,7 @@ int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
+std::string packet_trim_mode = "disabled";
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -164,18 +166,27 @@ void write_transport_event(FILE *fout, const char *event,
   ch.getInt = 1;
   packet->PeekHeader(ch);
   uint16_t source_port = 0;
+  uint32_t sequence = 0;
   if (protocol == 0x11)
     source_port = ch.udp.sport;
-  else if (protocol == 0xFC || protocol == 0xFD)
+  else if (protocol == 0xFC || protocol == 0xFD ||
+           protocol == kUecTrimRepairProtocol ||
+           protocol == kUecTrimNotificationProtocol)
     source_port = ch.ack.sport;
+  if (protocol == 0x11)
+    sequence = ch.udp.seq;
+  else if (protocol == 0xFC || protocol == 0xFD ||
+           protocol == kUecTrimRepairProtocol ||
+           protocol == kUecTrimNotificationProtocol)
+    sequence = ch.ack.seq;
   const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
-  fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
+    fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
           Simulator::Now().GetNanoSeconds(), event,
           protocol == 0x11 ? "data" : "control", protocol,
           dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
           dev->GetIfIndex(), source_host, destination_host, source_port,
-          packet->GetSize(), queue);
+      sequence, packet->GetSize(), queue);
   fflush(fout);
 }
 
@@ -204,6 +215,7 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
   const uint16_t source_port = ch.l3Prot == 0x11 ? ch.udp.sport : 0;
+  const uint32_t sequence = ch.l3Prot == 0x11 ? ch.udp.seq : 0;
   const char *event = "switch_unknown_drop";
   switch (static_cast<SwitchDropReason>(reason)) {
   case SwitchDropReason::Route:
@@ -216,11 +228,40 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
     event = "switch_egress_queue_drop";
     break;
   }
-  fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,-1\n",
+    fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
           Simulator::Now().GetNanoSeconds(), event,
           ch.l3Prot == 0x11 ? "data" : "control", ch.l3Prot,
           sw->GetId(), sw->GetNodeType(), source_host, destination_host,
-          source_port, packet->GetSize());
+      source_port, sequence, packet->GetSize());
+  fflush(fout);
+}
+
+void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
+                     Ptr<const Packet> packet, uint32_t trigger) {
+  CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                  CustomHeader::L4_Header);
+  ch.getInt = 1;
+  packet->PeekHeader(ch);
+  const bool forwardToDestination =
+      (ch.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1;
+  const uint32_t source_host = ip_to_node_id(Ipv4Address(
+      forwardToDestination ? ch.sip : ch.dip));
+  const uint32_t destination_host = ip_to_node_id(Ipv4Address(
+      forwardToDestination ? ch.dip : ch.sip));
+  const char *mode = forwardToDestination ? "ftd" : "bts";
+  const char *reason = "unknown";
+  switch (static_cast<PacketTrimTrigger>(trigger)) {
+  case PacketTrimTrigger::Admission:
+    reason = "admission";
+    break;
+  case PacketTrimTrigger::EgressQueue:
+    reason = "egress_queue";
+    break;
+  }
+    fprintf(fout, "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
+          Simulator::Now().GetNanoSeconds(), mode, reason, 0x11,
+          sw->GetId(), sw->GetNodeType(), source_host, destination_host,
+      ch.ack.sport, ch.ack.seq, ch.ack.trim_payload_size);
   fflush(fout);
 }
 
@@ -233,6 +274,16 @@ uint32_t data_loss_scope_value() {
     return static_cast<uint32_t>(DataLossScope::SwitchToHost);
   if (data_loss_scope == "switch_to_switch")
     return static_cast<uint32_t>(DataLossScope::SwitchToSwitch);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t packet_trim_mode_value() {
+  if (packet_trim_mode == "disabled")
+    return static_cast<uint32_t>(PacketTrimMode::Disabled);
+  if (packet_trim_mode == "ftd")
+    return static_cast<uint32_t>(PacketTrimMode::ForwardToDestination);
+  if (packet_trim_mode == "bts")
+    return static_cast<uint32_t>(PacketTrimMode::BackToSender);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -256,7 +307,9 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
 }
 
 void connect_transport_traces(FILE *fout, Ptr<QbbNetDevice> dev) {
-  if (data_loss_duration_ns != 0) {
+  if (data_loss_duration_ns != 0 ||
+      packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled)) {
     dev->TraceConnectWithoutContext(
         "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
                                                 "data_arrival", dev));
@@ -577,6 +630,8 @@ bool ReadConf(string network_configuration) {
       conf >> retransmission_timeout_ns;
     } else if (key.compare("MAX_RETRANSMISSION_RETRIES") == 0) {
       conf >> max_retransmission_retries;
+	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
+	  conf >> packet_trim_mode;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -703,6 +758,16 @@ bool ReadConf(string network_configuration) {
     std::cerr << "loss experiments require retransmission timeout and retry budget\n";
     return false;
   }
+  if (packet_trim_mode_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "PACKET_TRIM_MODE must be disabled, ftd, or bts\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
+    std::cerr << "packet trimming requires retransmission timeout and retry budget\n";
+    return false;
+  }
   if (data_loss_rng_stream >
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
@@ -811,14 +876,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   }
   fprintf(transport_event_file,
           "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
-      "destination_host,source_port,packet_bytes,queue\n");
+      "destination_host,source_port,sequence,packet_bytes,queue\n");
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
+        sw->SetAttribute("PacketTrimMode",
+                 UintegerValue(packet_trim_mode_value()));
       sw->TraceConnectWithoutContext(
           "SwitchDrop", MakeBoundCallback(&get_switch_drop,
                                             transport_event_file, sw));
+        sw->TraceConnectWithoutContext(
+          "PacketTrim", MakeBoundCallback(&get_switch_trim,
+                          transport_event_file, sw));
     }
   }
 

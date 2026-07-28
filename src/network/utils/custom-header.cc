@@ -94,7 +94,9 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 			len += tcp.length * 4;
 		else if (l3Prot == 0x11) // UDP
 			len += GetUdpHeaderSize();
-		else if (l3Prot == 0xFC || l3Prot == 0xFD)
+		else if (l3Prot == 0xFC || l3Prot == 0xFD ||
+				 l3Prot == kUecTrimRepairProtocol ||
+				 l3Prot == kUecTrimNotificationProtocol)
 			len += GetAckSerializedSize();
 		else if (l3Prot == 0xFF)
 			len += 8;
@@ -168,13 +170,16 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteU8(cnp.ecnBits);
 		  i.WriteU16(cnp.qfb);
 		  i.WriteU16(cnp.total);
-	  }else if (l3Prot == 0xFC || l3Prot == 0xFD){ // ACK or NACK
+	  }else if (l3Prot == 0xFC || l3Prot == 0xFD ||
+			l3Prot == kUecTrimRepairProtocol ||
+			l3Prot == kUecTrimNotificationProtocol){ // ACK, NACK, or trim control
 		  i.WriteU16(ack.sport);
 		  i.WriteU16(ack.dport);
 		  i.WriteU16(ack.flags);
 		  i.WriteU16(ack.pg);
 		  i.WriteU32(ack.seq);
-		  udp.ih.Serialize(i);
+		  i.WriteU32(ack.trim_payload_size);
+		  ack.ih.Serialize(i);
 	  }else if (l3Prot == 0xFE){ // PFC
 		  i.WriteU32 (pfc.time);
 		  i.WriteU32 (pfc.qlen);
@@ -303,12 +308,15 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  cnp.qfb = i.ReadU16();
 		  cnp.total = i.ReadU16();
 		  l4Size = 8;
-	  }else if (l3Prot == 0xFC || l3Prot == 0xFD){ // ACK or NACK
+	  }else if (l3Prot == 0xFC || l3Prot == 0xFD ||
+			l3Prot == kUecTrimRepairProtocol ||
+			l3Prot == kUecTrimNotificationProtocol){ // ACK, NACK, or trim control
 		  ack.sport = i.ReadU16();
 		  ack.dport = i.ReadU16();
 		  ack.flags = i.ReadU16();
 		  ack.pg = i.ReadU16();
 		  ack.seq = i.ReadU32();
+		  ack.trim_payload_size = i.ReadU32();
 		  if (getInt)
 			  ack.ih.Deserialize(i);
 		  l4Size = GetAckSerializedSize();
@@ -328,7 +336,7 @@ uint8_t CustomHeader::GetIpv4EcnBits (void) const{
 }
 
 uint32_t CustomHeader::GetAckSerializedSize(void){
-	return sizeof(ack.sport) + sizeof(ack.dport) + sizeof(ack.flags) + sizeof(ack.pg) + sizeof(ack.seq) + IntHeader::GetStaticSize();
+	return sizeof(ack.sport) + sizeof(ack.dport) + sizeof(ack.flags) + sizeof(ack.pg) + sizeof(ack.seq) + sizeof(ack.trim_payload_size) + IntHeader::GetStaticSize();
 }
 
 uint32_t CustomHeader::GetUdpHeaderSize(void){

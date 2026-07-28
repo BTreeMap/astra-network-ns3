@@ -17,6 +17,17 @@ enum class SwitchDropReason : uint32_t {
 	EgressQueue = 3,
 };
 
+enum class PacketTrimMode : uint32_t {
+	Disabled = 0,
+	ForwardToDestination,
+	BackToSender,
+};
+
+enum class PacketTrimTrigger : uint32_t {
+	Admission = 1,
+	EgressQueue,
+};
+
 class SwitchNode : public Node{
 	static const uint32_t pCnt = 1025;	// Number of ports used
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
@@ -38,16 +49,21 @@ protected:
 	uint64_t m_maxRtt;
 
 	uint32_t m_ackHighPrio; // set high priority for ACK/NACK
+	uint32_t m_packetTrimMode;
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
 	void SendToDev(Ptr<Packet>p, CustomHeader &ch);
+	bool SendTrimNotification(const CustomHeader &ch, uint32_t payloadSize,
+		PacketTrimTrigger trigger);
+	bool PacketTrimEnabledFor(const CustomHeader &ch) const;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);
 public:
 	Ptr<SwitchMmu> m_mmu;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDrop;
+	TracedCallback<Ptr<const Packet>, uint32_t> m_traceTrim;
 
 	static TypeId GetTypeId (void);
 	SwitchNode();

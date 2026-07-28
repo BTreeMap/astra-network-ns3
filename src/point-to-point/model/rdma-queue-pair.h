@@ -23,8 +23,14 @@ public:
 	uint64_t m_highest_sent;
 	uint64_t m_data_attempted_bytes;
 	uint64_t m_retransmitted_bytes;
+	uint64_t m_trimmed_payload_bytes;
 	uint32_t m_recovery_events;
-	uint32_t m_timeout_retries;
+	uint32_t m_trim_notifications;
+	uint32_t m_trim_ftd_repairs;
+	uint32_t m_trim_bts_notifications;
+	uint32_t m_trim_recovery_events;
+	uint32_t m_stale_trim_notifications;
+	uint32_t m_recovery_retries;
 	uint32_t m_failure_reason;
 	bool m_failed;
 	EventId m_retransmissionTimer;

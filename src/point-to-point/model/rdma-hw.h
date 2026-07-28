@@ -11,6 +11,11 @@
 
 namespace ns3 {
 
+enum class RdmaFailureReason : uint32_t {
+	TimeoutRetryExhausted = 1,
+	TrimRetryExhausted,
+};
+
 struct RdmaInterfaceMgr{
 	Ptr<QbbNetDevice> dev;
 	Ptr<RdmaQueuePairGroup> qpGrp;
@@ -67,6 +72,7 @@ public:
 	int ReceiveUdp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
+	int ReceiveTrim(Ptr<Packet> p, CustomHeader &ch);
 	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
 
 	void PCIePause(uint32_t nic_idx, uint32_t qIndex);
@@ -80,6 +86,9 @@ public:
 	static uint16_t EtherToPpp (uint16_t protocol);
 
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
+	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch,
+		bool isFtdRepair);
+	void SendTrimRepair(const CustomHeader &ch);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);

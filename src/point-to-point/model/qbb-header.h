@@ -24,7 +24,8 @@ class qbbHeader : public Header
 public:
  
   enum {
-	  FLAG_CNP = 0
+    FLAG_CNP = 0,
+    FLAG_TRIM_FTD = 1
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -40,6 +41,8 @@ public:
   void SetDport(uint32_t _dport);
   void SetTs(uint64_t ts);
   void SetCnp();
+  void SetTrimPayloadSize(uint32_t payloadSize);
+  void SetTrimFtd(bool forwardToDestination);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -53,6 +56,8 @@ public:
   uint16_t GetDport() const;
   uint64_t GetTs() const;
   uint8_t GetCnp() const;
+  uint32_t GetTrimPayloadSize() const;
+  bool IsTrimFtd() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;
@@ -67,6 +72,7 @@ private:
   uint16_t flags;
   uint16_t m_pg;
   uint32_t m_seq; // the qbb sequence number.
+  uint32_t m_trimPayloadSize;
   IntHeader ih;
   
 };

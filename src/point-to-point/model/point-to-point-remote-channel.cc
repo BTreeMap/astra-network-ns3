@@ -22,7 +22,9 @@
 #include "point-to-point-net-device.h"
 
 #include "ns3/log.h"
+#ifdef NS3_MPI
 #include "ns3/mpi-interface.h"
+#endif
 #include "ns3/packet.h"
 #include "ns3/simulator.h"
 
@@ -67,9 +69,13 @@ PointToPointRemoteChannel::TransmitStart(Ptr<const Packet> p,
     uint32_t wire = src == GetSource(0) ? 0 : 1;
     Ptr<PointToPointNetDevice> dst = GetDestination(wire);
 
+#ifdef NS3_MPI
     // Calculate the rxTime (absolute)
     Time rxTime = Simulator::Now() + txTime + GetDelay();
     MpiInterface::SendPacket(p->Copy(), rxTime, dst->GetNode()->GetId(), dst->GetIfIndex());
+#else
+    NS_FATAL_ERROR("Can't use distributed simulator without MPI compiled in");
+#endif
     return true;
 }
 
