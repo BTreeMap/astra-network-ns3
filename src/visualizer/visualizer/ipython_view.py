@@ -122,7 +122,9 @@ class IterableIPShell:
 
         # InteractiveShell inherits from SingletonConfigurable, so use instance()
         #
-        self.IP = IPython.terminal.embed.InteractiveShellEmbed.instance(config=cfg, user_ns=user_ns)
+        self.IP = IPython.terminal.embed.InteractiveShellEmbed.instance(
+            config=cfg, user_ns=user_ns
+        )
 
         if IPython.version_info < (8,):
             sys.stdout, sys.stderr = old_stdout, old_stderr
@@ -148,7 +150,9 @@ class IterableIPShell:
         # Avoid using input splitter when not really needed.
         # Perhaps it could work even before 5.8.0
         # But it definitely does not work any more with >= 7.0.0
-        self.no_input_splitter = parse_version(IPython.release.version) >= parse_version("5.8.0")
+        self.no_input_splitter = parse_version(
+            IPython.release.version
+        ) >= parse_version("5.8.0")
         self.lines = []
         self.indent_spaces = ""
 
@@ -202,7 +206,9 @@ class IterableIPShell:
         else:
             if self.no_input_splitter:
                 self.lines.append(line)
-                (status, self.indent_spaces) = self.IP.check_complete("\n".join(self.lines))
+                (status, self.indent_spaces) = self.IP.check_complete(
+                    "\n".join(self.lines)
+                )
                 self.iter_more = status == "incomplete"
             else:
                 self.IP.input_splitter.push(line)
@@ -315,7 +321,9 @@ class IterableIPShell:
                 return str1
 
             if possibilities[1]:
-                common_prefix = reduce(_commonPrefix, possibilities[1]) or split_line[-1]
+                common_prefix = (
+                    reduce(_commonPrefix, possibilities[1]) or split_line[-1]
+                )
                 completed = line[: -len(split_line[-1])] + common_prefix
             else:
                 completed = line
@@ -385,6 +393,7 @@ class ConsoleView(Gtk.TextView):
     @ivar line_start: Start of command line mark.
     @type line_start: Gtk.TextMark
     """
+
     ANSI_COLORS = {
         "0;30": ("Black", None),
         "0;31": ("Red", None),
@@ -457,7 +466,9 @@ class ConsoleView(Gtk.TextView):
         """
         segments = self.color_pat.split(text)
         segment = segments.pop(0)
-        start_mark = self.text_buffer.create_mark(None, self.text_buffer.get_end_iter(), True)
+        start_mark = self.text_buffer.create_mark(
+            None, self.text_buffer.get_end_iter(), True
+        )
         self.text_buffer.insert(self.text_buffer.get_end_iter(), segment)
 
         if segments:
@@ -514,7 +525,9 @@ class ConsoleView(Gtk.TextView):
         """
         iter = self.text_buffer.get_iter_at_mark(self.line_start)
         iter.forward_to_line_end()
-        self.text_buffer.delete(self.text_buffer.get_iter_at_mark(self.line_start), iter)
+        self.text_buffer.delete(
+            self.text_buffer.get_iter_at_mark(self.line_start), iter
+        )
         self._write(text, True)
 
     def getCurrentLine(self):
@@ -596,10 +609,15 @@ class ConsoleView(Gtk.TextView):
             insert_iter.backward_cursor_position()
             if not insert_iter.editable(True):
                 return True
-        elif event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in [ord("L"), ord("l")]:
+        elif event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in [
+            ord("L"),
+            ord("l"),
+        ]:
             # clear previous output on Ctrl+L, but remember current input line + cursor position
             cursor_offset = self.text_buffer.get_property("cursor-position")
-            cursor_pos_in_line = cursor_offset - start_iter.get_offset() + len(self.prompt)
+            cursor_pos_in_line = (
+                cursor_offset - start_iter.get_offset() + len(self.prompt)
+            )
             current_input = self.text_buffer.get_text(
                 start_iter, self.text_buffer.get_end_iter(), False
             )
@@ -607,9 +625,14 @@ class ConsoleView(Gtk.TextView):
             self.text_buffer.move_mark(
                 self.line_start, self.text_buffer.get_iter_at_offset(len(self.prompt))
             )
-            self.text_buffer.place_cursor(self.text_buffer.get_iter_at_offset(cursor_pos_in_line))
+            self.text_buffer.place_cursor(
+                self.text_buffer.get_iter_at_offset(cursor_pos_in_line)
+            )
             return True
-        elif event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in [Gdk.KEY_k, Gdk.KEY_K]:
+        elif event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in [
+            Gdk.KEY_k,
+            Gdk.KEY_K,
+        ]:
             # clear text after input cursor on Ctrl+K
             if insert_iter.editable(True):
                 self.text_buffer.delete(insert_iter, self.text_buffer.get_end_iter())
@@ -620,9 +643,15 @@ class ConsoleView(Gtk.TextView):
             return True
         elif not event.string:
             pass
-        elif start_iter.compare(insert_iter) <= 0 and start_iter.compare(selection_iter) <= 0:
+        elif (
+            start_iter.compare(insert_iter) <= 0
+            and start_iter.compare(selection_iter) <= 0
+        ):
             pass
-        elif start_iter.compare(insert_iter) > 0 and start_iter.compare(selection_iter) > 0:
+        elif (
+            start_iter.compare(insert_iter) > 0
+            and start_iter.compare(selection_iter) > 0
+        ):
             self.text_buffer.place_cursor(start_iter)
         elif insert_iter.compare(selection_iter) < 0:
             self.text_buffer.move_mark(insert_mark, start_iter)
@@ -667,7 +696,9 @@ class IPythonView(ConsoleView, IterableIPShell):
         """
         ConsoleView.__init__(self)
         self.cout = StringIO()
-        IterableIPShell.__init__(self, cout=self.cout, cerr=self.cout, input_func=self.raw_input)
+        IterableIPShell.__init__(
+            self, cout=self.cout, cerr=self.cout, input_func=self.raw_input
+        )
         self.interrupt = False
         self.execute()
         self.prompt = self.generatePrompt(False)

@@ -36,7 +36,9 @@ def main(argv):
     # interact in real-time and therefore we have to use the real-time simulator
     # and take the time to calculate checksums.
     #
-    ns.GlobalValue.Bind("SimulatorImplementationType", ns.StringValue("ns3::RealtimeSimulatorImpl"))
+    ns.GlobalValue.Bind(
+        "SimulatorImplementationType", ns.StringValue("ns3::RealtimeSimulatorImpl")
+    )
     ns.GlobalValue.Bind("ChecksumEnabled", ns.BooleanValue(True))
 
     #

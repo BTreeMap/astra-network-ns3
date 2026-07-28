@@ -56,7 +56,9 @@ def bianchi_ax(data_rate, ack_rate, k, difs):
     N_DBPS = data_rate * T_SYMBOL_DATA  # number of data bits per OFDM symbol
 
     if Aggregation_Type == "NONE":
-        N_SYMBOLS = math.ceil((L_SERVICE + (L_MAC + L_DATA + L_APP_HDR) + L_TAIL) / N_DBPS)
+        N_SYMBOLS = math.ceil(
+            (L_SERVICE + (L_MAC + L_DATA + L_APP_HDR) + L_TAIL) / N_DBPS
+        )
         T_DATA = T_PHY_DATA + (T_SYMBOL_DATA * N_SYMBOLS)
         K_MPDU = 1
         K_MSDU = 1
@@ -65,7 +67,12 @@ def bianchi_ax(data_rate, ack_rate, k, difs):
         N_SYMBOLS = math.ceil(
             (
                 L_SERVICE
-                + K_MPDU * (L_MAC + L_MPDU_HEADER + K_MSDU * (L_MSDU_HEADER + L_DATA + L_APP_HDR))
+                + K_MPDU
+                * (
+                    L_MAC
+                    + L_MPDU_HEADER
+                    + K_MSDU * (L_MSDU_HEADER + L_DATA + L_APP_HDR)
+                )
                 + L_TAIL
             )
             / N_DBPS
@@ -74,7 +81,8 @@ def bianchi_ax(data_rate, ack_rate, k, difs):
 
     if Aggregation_Type == "A_MPDU":
         N_SYMBOLS = math.ceil(
-            (L_SERVICE + K_MPDU * (L_MAC + L_MPDU_HEADER + L_DATA + L_APP_HDR) + L_TAIL) / N_DBPS
+            (L_SERVICE + K_MPDU * (L_MAC + L_MPDU_HEADER + L_DATA + L_APP_HDR) + L_TAIL)
+            / N_DBPS
         )
         T_DATA = T_PHY_DATA + (T_SYMBOL_DATA * N_SYMBOLS)
 
@@ -128,7 +136,9 @@ def bianchi_ax(data_rate, ack_rate, k, difs):
 def str_result(bianchi_result, mcs, bw):
     str_bianchi = "    {" + '"HeMcs{:d}'.format(mcs) + '_{:d}MHz"'.format(bw) + ", {\n"
     for i in range(len(bianchi_result)):
-        str_tmp = "        {" + "{:d}, {:.4f}".format(5 * (i + 1), bianchi_result[i]) + "},\n"
+        str_tmp = (
+            "        {" + "{:d}, {:.4f}".format(5 * (i + 1), bianchi_result[i]) + "},\n"
+        )
         str_bianchi = str_bianchi + str_tmp
     str_bianchi = str_bianchi + "    }},\n"
     print(str_bianchi)
@@ -150,7 +160,20 @@ data_rates_20MHz = [
     129e6,
     143.4e6,
 ]
-ack_rates_20MHz = [6e6, 12e6, 12e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6]
+ack_rates_20MHz = [
+    6e6,
+    12e6,
+    12e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+]
 data_rates_40MHz = [
     17.2e6,
     34.4e6,
@@ -165,7 +188,20 @@ data_rates_40MHz = [
     258.1e6,
     286.8e6,
 ]
-ack_rates_40MHz = [6e6, 12e6, 12e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6]
+ack_rates_40MHz = [
+    6e6,
+    12e6,
+    12e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+]
 data_rates_80MHz = [
     36e6,
     72.1e6,
@@ -180,7 +216,20 @@ data_rates_80MHz = [
     540.4e6,
     600.5e6,
 ]
-ack_rates_80MHz = [6e6, 12e6, 12e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6]
+ack_rates_80MHz = [
+    6e6,
+    12e6,
+    12e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+]
 data_rates_160MHz = [
     72.1e6,
     144.1e6,
@@ -195,7 +244,20 @@ data_rates_160MHz = [
     1080.9e6,
     1201e6,
 ]
-ack_rates_160MHz = [6e6, 12e6, 12e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6, 24e6]
+ack_rates_160MHz = [
+    6e6,
+    12e6,
+    12e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+    24e6,
+]
 
 # Generate results with frame aggregation disabled
 k = 1

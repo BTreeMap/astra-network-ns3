@@ -75,8 +75,12 @@ def main(argv):
     inetAddress = ns.InetSocketAddress(ns.Ipv4Address("10.0.0.1"), port)
     onOffHelper = ns.OnOffHelper("ns3::UdpSocketFactory", inetAddress.ConvertTo())
     onOffHelper.SetAttribute("DataRate", ns.DataRateValue(ns.DataRate("100kbps")))
-    onOffHelper.SetAttribute("OnTime", ns.StringValue("ns3::ConstantRandomVariable[Constant=1]"))
-    onOffHelper.SetAttribute("OffTime", ns.StringValue("ns3::ConstantRandomVariable[Constant=0]"))
+    onOffHelper.SetAttribute(
+        "OnTime", ns.StringValue("ns3::ConstantRandomVariable[Constant=1]")
+    )
+    onOffHelper.SetAttribute(
+        "OffTime", ns.StringValue("ns3::ConstantRandomVariable[Constant=0]")
+    )
 
     addresses = []
     nodes = []
@@ -136,8 +140,16 @@ def main(argv):
         print("  Lost Packets: ", st.lostPackets, file=os)
         if st.rxPackets > 0:
             print("  Mean{Delay}: ", (st.delaySum.GetSeconds() / st.rxPackets), file=os)
-            print("  Mean{Jitter}: ", (st.jitterSum.GetSeconds() / (st.rxPackets - 1)), file=os)
-            print("  Mean{Hop Count}: ", float(st.timesForwarded) / st.rxPackets + 1, file=os)
+            print(
+                "  Mean{Jitter}: ",
+                (st.jitterSum.GetSeconds() / (st.rxPackets - 1)),
+                file=os,
+            )
+            print(
+                "  Mean{Hop Count}: ",
+                float(st.timesForwarded) / st.rxPackets + 1,
+                file=os,
+            )
 
         if 0:
             print("Delay Histogram", file=os)

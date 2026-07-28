@@ -362,7 +362,9 @@ def main(argv):
     #  Create a packet sink to receive these packets
     sink = ns.PacketSinkHelper(
         "ns3::UdpSocketFactory",
-        ns.InetSocketAddress(ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port)).ConvertTo(),
+        ns.InetSocketAddress(
+            ns.InetSocketAddress(ns.Ipv4Address.GetAny(), port)
+        ).ConvertTo(),
     )
     sinkContainer = ns.NodeContainer(appSink)
     apps = sink.Install(sinkContainer)

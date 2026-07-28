@@ -58,7 +58,8 @@ class ShowOlsrRoutingTable(InformationWindow):
         treeview.show()
         sw = Gtk.ScrolledWindow()
         sw.set_properties(
-            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
         )
         sw.show()
         sw.add(treeview)
@@ -71,15 +72,21 @@ class ShowOlsrRoutingTable(InformationWindow):
         treeview.append_column(column)
 
         # Next hop
-        column = Gtk.TreeViewColumn("Next hop", Gtk.CellRendererText(), text=self.COLUMN_NEXT_HOP)
+        column = Gtk.TreeViewColumn(
+            "Next hop", Gtk.CellRendererText(), text=self.COLUMN_NEXT_HOP
+        )
         treeview.append_column(column)
 
         # Interface
-        column = Gtk.TreeViewColumn("Interface", Gtk.CellRendererText(), text=self.COLUMN_INTERFACE)
+        column = Gtk.TreeViewColumn(
+            "Interface", Gtk.CellRendererText(), text=self.COLUMN_INTERFACE
+        )
         treeview.append_column(column)
 
         # Num. Hops
-        column = Gtk.TreeViewColumn("Num. Hops", Gtk.CellRendererText(), text=self.COLUMN_NUM_HOPS)
+        column = Gtk.TreeViewColumn(
+            "Num. Hops", Gtk.CellRendererText(), text=self.COLUMN_NUM_HOPS
+        )
         treeview.append_column(column)
 
         self.visualizer.add_information_window(self)

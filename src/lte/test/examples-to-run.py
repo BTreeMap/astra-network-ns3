@@ -109,7 +109,11 @@ cpp_examples = [
         "True",
         "True",
     ),
-    ("lena-radio-link-failure --numberOfEnbs=1 --useIdealRrc=0 --simTime=17", "True", "True"),
+    (
+        "lena-radio-link-failure --numberOfEnbs=1 --useIdealRrc=0 --simTime=17",
+        "True",
+        "True",
+    ),
     (
         "lena-radio-link-failure --numberOfEnbs=2 --useIdealRrc=0 --interSiteDistance=700 --simTime=17",
         "True",

@@ -72,10 +72,14 @@ class WifiLink(Link):
             self.node2.remove_link(self)
         self.node2 = ap
         if self.node2 is None:
-            self.canvas_item.set_property("visibility", GooCanvas.CanvasItemVisibility.HIDDEN)
+            self.canvas_item.set_property(
+                "visibility", GooCanvas.CanvasItemVisibility.HIDDEN
+            )
         else:
             self.node2.add_link(self)
-            self.canvas_item.set_property("visibility", GooCanvas.CanvasItemVisibility.VISIBLE)
+            self.canvas_item.set_property(
+                "visibility", GooCanvas.CanvasItemVisibility.VISIBLE
+            )
         self.update_points()
 
     def update_points(self):
@@ -120,7 +124,13 @@ class WifiLink(Link):
                 "SSID: %s\n"
                 "BSSID: %s"
             )
-            % (self.node1.node_index, self.node2.node_index, d, mac.GetSsid(), mac.GetBssid())
+            % (
+                self.node1.node_index,
+                self.node2.node_index,
+                d,
+                mac.GetSsid(),
+                mac.GetBssid(),
+            )
         )
 
 

@@ -221,7 +221,9 @@ def find_files_to_check_style(
         if should_analyze_file(f, [], FILE_EXTENSIONS_TO_CHECK_FORMATTING):
             files_to_check_formatting.append(f)
 
-        if should_analyze_file(f, FILES_TO_CHECK_WHITESPACE, FILE_EXTENSIONS_TO_CHECK_WHITESPACE):
+        if should_analyze_file(
+            f, FILES_TO_CHECK_WHITESPACE, FILE_EXTENSIONS_TO_CHECK_WHITESPACE
+        ):
             files_to_check_whitespace.append(f)
 
         if should_analyze_file(f, FILES_TO_CHECK_TABS, FILE_EXTENSIONS_TO_CHECK_TABS):
@@ -408,7 +410,10 @@ def check_style_files(
             filenames,
             itertools.repeat(fix),
             itertools.repeat(verbose),
-            *[arg if isinstance(arg, list) else itertools.repeat(arg) for arg in kwargs.values()],
+            *[
+                arg if isinstance(arg, list) else itertools.repeat(arg)
+                for arg in kwargs.values()
+            ],
         )
 
         for filename, is_file_compliant, verbose_infos in non_compliant_files_results:
@@ -429,7 +434,9 @@ def check_style_files(
         if fix:
             print(f"- Fixed {style_check_str} in the files ({n_non_compliant_files}):")
         else:
-            print(f"- Detected {style_check_str} in the files ({n_non_compliant_files}):")
+            print(
+                f"- Detected {style_check_str} in the files ({n_non_compliant_files}):"
+            )
 
         for f in non_compliant_files:
             if verbose:
@@ -611,7 +618,7 @@ def check_include_prefixes_line(
                 [
                     f'{filename}:{line_number + 1}:{header_index + 1}: error: #include headers from the same module with the "ns3/" prefix detected',
                     f"    {line_stripped}",
-                    f'    {"":{header_index}}^',
+                    f"    {'':{header_index}}^",
                 ]
             )
 
@@ -645,7 +652,7 @@ def check_whitespace_line(
         verbose_infos = [
             f"{filename}:{line_number + 1}:{len(line_fixed_stripped_expanded) + 1}: error: Trailing whitespace detected",
             f"    {line_fixed_stripped_expanded}",
-            f'    {"":{len(line_fixed_stripped_expanded)}}^',
+            f"    {'':{len(line_fixed_stripped_expanded)}}^",
         ]
 
     return (is_line_compliant, line_fixed, verbose_infos)
@@ -680,7 +687,7 @@ def check_tabs_line(
         verbose_infos = [
             f"{filename}:{line_number + 1}:{tab_index + 1}: error: Tab detected",
             f"    {line.rstrip()}",
-            f'    {"":{tab_index}}^',
+            f"    {'':{tab_index}}^",
         ]
 
     return (is_line_compliant, line_fixed, verbose_infos)
@@ -776,6 +783,8 @@ if __name__ == "__main__":
     if not all_checks_successful:
         if args.verbose:
             print("")
-            print('NOTE: To fix the files automatically, run this script with the flag "--fix"')
+            print(
+                'NOTE: To fix the files automatically, run this script with the flag "--fix"'
+            )
 
         sys.exit(1)

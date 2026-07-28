@@ -168,7 +168,12 @@ class TestBaseClass:
                     print_case_in_file(case_string, out)
                     progress += 1
                     ret = subprocess.call(
-                        cmd, shell=True, env=self.my_env, stdout=outstream, stderr=out, cwd=base_dir
+                        cmd,
+                        shell=True,
+                        env=self.my_env,
+                        stdout=outstream,
+                        stderr=out,
+                        cwd=base_dir,
                     )
                     if not ret:
                         passed += 1
