@@ -313,6 +313,8 @@ class UecTrimSwitchTest : public TestCase
         ip.SetSource(sender);
         ip.SetDestination(receiver);
         ip.SetProtocol(0x11);
+        // UEC 1.0.3 section 4.1: only DSCP_TRIMMABLE packets may be trimmed.
+        ip.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
         ip.SetPayloadSize(dataPacket->GetSize());
         dataPacket->AddHeader(ip);
         PppHeader ppp;
@@ -328,6 +330,7 @@ class UecTrimSwitchTest : public TestCase
             dataPacket->GetSize() - dataHeader.GetSerializedSize();
         const bool expectedForward =
             m_mode == PacketTrimMode::ForwardToDestination;
+        const uint32_t dataPacketBytes = dataPacket->GetSize();
 
         m_trimCount = 0;
         m_dropCount = 0;
@@ -352,6 +355,15 @@ class UecTrimSwitchTest : public TestCase
             NS_TEST_EXPECT_MSG_EQ(m_trimForward,
                                   expectedForward,
                                   "trim metadata must preserve the configured direction");
+            NS_TEST_EXPECT_MSG_EQ(
+                m_trimDscp, kUetDscpTrimmed,
+                "a trimmed packet must carry the DSCP_TRIMMED codepoint");
+            if (expectedForward)
+            {
+                NS_TEST_EXPECT_MSG_LT(
+                    m_trimmedPacketBytes, dataPacketBytes,
+                    "a trimmed packet must never exceed the original packet size");
+            }
             NS_TEST_EXPECT_MSG_EQ(
                 m_trimSource,
                 (m_mode == PacketTrimMode::ForwardToDestination ? sender.Get()
@@ -390,12 +402,25 @@ class UecTrimSwitchTest : public TestCase
         parsed.getInt = 1;
         packet->PeekHeader(parsed);
         ++m_trimCount;
-        m_trimPayload = parsed.ack.trim_payload_size;
         m_trimTrigger = trigger;
-        m_trimForward =
-            (parsed.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1;
         m_trimSource = parsed.sip;
         m_trimDestination = parsed.dip;
+        m_trimDscp = parsed.GetIpv4Dscp();
+        // A UEC 1.0.3 trim keeps the original UDP packet, truncated and remarked;
+        // the non-UET back-to-sender mode emits its own control packet instead.
+        m_trimForward = parsed.l3Prot == 0x11;
+        if (m_trimForward)
+        {
+            m_trimPayload = parsed.udp.payload_size > CustomHeader::GetUdpHeaderSize()
+                                ? parsed.udp.payload_size -
+                                      CustomHeader::GetUdpHeaderSize()
+                                : 0;
+            m_trimmedPacketBytes = packet->GetSize();
+        }
+        else
+        {
+            m_trimPayload = parsed.ack.trim_payload_size;
+        }
     }
 
     void RecordDrop(Ptr<const Packet> packet, uint32_t reason)
@@ -417,6 +442,8 @@ class UecTrimSwitchTest : public TestCase
     bool m_trimForward = false;
     uint32_t m_trimSource = 0;
     uint32_t m_trimDestination = 0;
+    uint32_t m_trimDscp = 0;
+    uint32_t m_trimmedPacketBytes = 0;
     uint32_t m_dropCount = 0;
     uint32_t m_dropProtocol = 0;
     uint32_t m_dropReason = 0;
@@ -462,7 +489,9 @@ class UecTrimRecoveryTest : public TestCase
         CustomHeader trim;
         trim.sip = receiver.Get();
         trim.dip = sender.Get();
-        trim.ack.sport = kSourcePort;
+        trim.ack.flags = 0;
+        trim.ack.dport = kSourcePort;
+        trim.ack.sport = 10001;
         trim.ack.pg = kPriorityGroup;
         trim.ack.seq = 0;
         trim.ack.trim_payload_size = kTrimmedBytes;
@@ -512,26 +541,40 @@ class UecTrimRecoveryTest : public TestCase
         receiverDevice->m_traceEnqueue.ConnectWithoutContext(
             MakeCallback(&UecTrimRecoveryTest::RecordRepair, this));
 
-        trim.l3Prot = kUecTrimNotificationProtocol;
-        trim.sip = sender.Get();
-        trim.dip = receiver.Get();
-        trim.ack.flags = 1 << qbbHeader::FLAG_TRIM_FTD;
-        receiverHw->ReceiveTrim(Create<Packet>(), trim);
+        // UEC 1.0.3 section 3.5.15.1: a trimmed data packet is recognized by
+        // ip.dscp before any protocol dispatch, MUST NOT advance receiver state,
+        // and MUST produce a NACK identifying the original packet.
+        CustomHeader trimmed;
+        trimmed.l3Prot = 0x11;
+        trimmed.m_tos = kUetDscpTrimmed << 2;
+        trimmed.m_ttl = 64;
+        trimmed.ipid = 0;
+        trimmed.sip = sender.Get();
+        trimmed.dip = receiver.Get();
+        trimmed.udp.sport = kSourcePort;
+        trimmed.udp.dport = 10001;
+        trimmed.udp.pg = kPriorityGroup;
+        trimmed.udp.seq = 0;
+        // Trimming leaves the UDP length field unmodified, so it still reports
+        // the size of the packet whose payload was discarded.
+        trimmed.udp.payload_size =
+            kTrimmedBytes + CustomHeader::GetUdpHeaderSize();
+        receiverHw->Receive(Create<Packet>(), trimmed);
         NS_TEST_EXPECT_MSG_EQ(receiverHw->m_rxQpMap.empty(),
                               true,
-                              "FTD metadata must not create or advance a receiver QP");
+                              "a trimmed packet must not create or advance a receiver QP");
         NS_TEST_EXPECT_MSG_EQ(m_repairCount,
                               1,
-                              "FTD metadata must produce one repair control packet");
+                              "a trimmed packet must produce one NACK control packet");
         NS_TEST_EXPECT_MSG_EQ(m_repairProtocol,
                               kUecTrimRepairProtocol,
-                              "FTD repair must use its dedicated control protocol");
+                              "the trim NACK must use its dedicated control protocol");
         NS_TEST_EXPECT_MSG_EQ(m_repairSequence,
                               0,
-                              "FTD repair must preserve the missing byte range");
+                              "the trim NACK must preserve the missing byte range");
         NS_TEST_EXPECT_MSG_EQ(m_repairPayloadBytes,
                               kTrimmedBytes,
-                              "FTD repair must preserve the missing payload length");
+                              "the trim NACK must preserve the missing payload length");
     }
 
   private:

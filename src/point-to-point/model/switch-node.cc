@@ -288,6 +288,11 @@ bool SwitchNode::SendTrimNotification(Ptr<const Packet> original,
 		CustomHeader::L4_Header);
 	trimCh.getInt = 1;
 	trimPacket->PeekHeader(trimCh);
+	// Unlike a trimmed packet, the notification is a distinct packet travelling
+	// the reverse direction, so it may have no route. Report that as the original
+	// data drop rather than consuming the data packet silently.
+	if (GetOutDev(trimPacket, trimCh) < 0)
+		return false;
 	m_traceTrim(trimPacket, static_cast<uint32_t>(trigger));
 	SendToDev(trimPacket, trimCh);
 	return true;
