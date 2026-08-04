@@ -335,6 +335,10 @@ uint8_t CustomHeader::GetIpv4EcnBits (void) const{
 	return m_tos & 0x3;
 }
 
+uint8_t CustomHeader::GetIpv4Dscp (void) const{
+	return (m_tos >> 2) & 0x3f;
+}
+
 uint32_t CustomHeader::GetAckSerializedSize(void){
 	return sizeof(ack.sport) + sizeof(ack.dport) + sizeof(ack.flags) + sizeof(ack.pg) + sizeof(ack.seq) + sizeof(ack.trim_payload_size) + IntHeader::GetStaticSize();
 }

@@ -72,6 +72,18 @@ uint64_t data_loss_rng_stream = 51;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
 std::string packet_trim_mode = "disabled";
+// UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
+// TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
+// the trimmed queue must be a distinct non-zero index.
+uint32_t packet_trim_queue = 2;
+// MIN_TRIM_SIZE in IP payload bytes; UEC 1.0.3 Table 4-1 requires 24 B for UET
+// over UDP/IP so the UDP and PDS request headers survive trimming.
+uint32_t min_trim_size = 24;
+uint32_t packet_trim_lasthop = 1;
+// Percent of egress bandwidth TC_med may take from TC_low. UEC 1.0.3 section 4.1
+// recommends WDRR at 25% and warns that an unrestricted trimmed class can drive
+// congestion collapse.
+uint32_t packet_trim_queue_weight = 25;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -181,9 +193,13 @@ void write_transport_event(FILE *fout, const char *event,
     sequence = ch.ack.seq;
   const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
+  // A trimmed packet rides the UDP protocol number but carries no payload, so
+  // it is reported on the control plane alongside ACKs and NACKs.
+  const bool payload_bearing =
+      protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
     fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
           Simulator::Now().GetNanoSeconds(), event,
-          protocol == 0x11 ? "data" : "control", protocol,
+          payload_bearing ? "data" : "control", protocol,
           dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
           dev->GetIfIndex(), source_host, destination_host, source_port,
       sequence, packet->GetSize(), queue);
@@ -214,8 +230,12 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   packet->PeekHeader(ch);
   const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
-  const uint16_t source_port = ch.l3Prot == 0x11 ? ch.udp.sport : 0;
-  const uint32_t sequence = ch.l3Prot == 0x11 ? ch.udp.seq : 0;
+  const bool trimmed = IsUetTrimmedDscp(ch.GetIpv4Dscp());
+  const bool udp = ch.l3Prot == 0x11;
+  const uint16_t source_port =
+      udp ? ch.udp.sport
+          : (trimmed ? ch.ack.sport : 0);
+  const uint32_t sequence = udp ? ch.udp.seq : (trimmed ? ch.ack.seq : 0);
   const char *event = "switch_unknown_drop";
   switch (static_cast<SwitchDropReason>(reason)) {
   case SwitchDropReason::Route:
@@ -227,10 +247,15 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   case SwitchDropReason::EgressQueue:
     event = "switch_egress_queue_drop";
     break;
+  case SwitchDropReason::TrimmedQueue:
+    // UEC 1.0.3 section 4.1: trimmed packets remain subject to loss at the
+    // trimming switch and at every downstream TC_med queue.
+    event = "switch_trimmed_queue_drop";
+    break;
   }
     fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
           Simulator::Now().GetNanoSeconds(), event,
-          ch.l3Prot == 0x11 ? "data" : "control", ch.l3Prot,
+          (udp || trimmed) ? "data" : "control", ch.l3Prot,
           sw->GetId(), sw->GetNodeType(), source_host, destination_host,
       source_port, sequence, packet->GetSize());
   fflush(fout);
@@ -242,12 +267,24 @@ void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  const bool forwardToDestination =
-      (ch.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1;
+  // A UEC-conformant trim keeps the original UDP packet, truncated and remarked
+  // DSCP_TRIMMED; the non-UET back-to-sender mode emits its own notification.
+  const bool forwardToDestination = ch.l3Prot == 0x11;
   const uint32_t source_host = ip_to_node_id(Ipv4Address(
       forwardToDestination ? ch.sip : ch.dip));
   const uint32_t destination_host = ip_to_node_id(Ipv4Address(
       forwardToDestination ? ch.dip : ch.sip));
+  const uint16_t source_port =
+      forwardToDestination ? ch.udp.sport : ch.ack.dport;
+  const uint32_t sequence = forwardToDestination ? ch.udp.seq : ch.ack.seq;
+  // The UDP length field is not modified by trimming, so it still reports the
+  // payload that the trim replaced.
+  const uint32_t trimmed_payload =
+      forwardToDestination
+          ? (ch.udp.payload_size > CustomHeader::GetUdpHeaderSize()
+                 ? ch.udp.payload_size - CustomHeader::GetUdpHeaderSize()
+                 : 0)
+          : ch.ack.trim_payload_size;
   const char *mode = forwardToDestination ? "ftd" : "bts";
   const char *reason = "unknown";
   switch (static_cast<PacketTrimTrigger>(trigger)) {
@@ -257,11 +294,17 @@ void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
   case PacketTrimTrigger::EgressQueue:
     reason = "egress_queue";
     break;
+  case PacketTrimTrigger::AdmissionLastHop:
+    reason = "lasthop_admission";
+    break;
+  case PacketTrimTrigger::EgressQueueLastHop:
+    reason = "lasthop_egress_queue";
+    break;
   }
     fprintf(fout, "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
-          Simulator::Now().GetNanoSeconds(), mode, reason, 0x11,
+          Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot,
           sw->GetId(), sw->GetNodeType(), source_host, destination_host,
-      ch.ack.sport, ch.ack.seq, ch.ack.trim_payload_size);
+      source_port, sequence, trimmed_payload);
   fflush(fout);
 }
 
@@ -632,6 +675,14 @@ bool ReadConf(string network_configuration) {
       conf >> max_retransmission_retries;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
+	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
+	  conf >> packet_trim_queue;
+	} else if (key.compare("MIN_TRIM_SIZE") == 0) {
+	  conf >> min_trim_size;
+	} else if (key.compare("PACKET_TRIM_LASTHOP") == 0) {
+	  conf >> packet_trim_lasthop;
+	} else if (key.compare("PACKET_TRIM_QUEUE_WEIGHT") == 0) {
+	  conf >> packet_trim_queue_weight;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -768,6 +819,30 @@ bool ReadConf(string network_configuration) {
     std::cerr << "packet trimming requires retransmission timeout and retry budget\n";
     return false;
   }
+  // UEC 1.0.3 section 4.1.4.1: switches MUST place trimmed packets in a traffic
+  // class distinct from untrimmed data, and DSCP_TRIMMED MUST differ from
+  // DSCP_CONTROL. Queue 0 carries DSCP_CONTROL, so TC_med cannot be queue 0.
+  if (packet_trim_queue == 0 || packet_trim_queue > 7) {
+    std::cerr << "PACKET_TRIM_QUEUE must name a TC_med queue in [1,7]\n";
+    return false;
+  }
+  // UEC 1.0.3 Table 4-1: UET over UDP/IP needs 24 B so the UDP header and the
+  // PDS request header survive trimming. The switch additionally raises the
+  // retained prefix to cover any INT header the configured CC algorithm adds.
+  if (min_trim_size < 24) {
+    std::cerr << "MIN_TRIM_SIZE must be at least 24 bytes (UEC 1.0.3 Table 4-1)\n";
+    return false;
+  }
+  if (packet_trim_queue_weight == 0 || packet_trim_queue_weight > 100) {
+    std::cerr << "PACKET_TRIM_QUEUE_WEIGHT must be a percentage in [1,100]\n";
+    return false;
+  }
+  if (packet_trim_mode_value() ==
+      static_cast<uint32_t>(PacketTrimMode::BackToSender)) {
+    std::cerr << "warning: PACKET_TRIM_MODE bts sends trim metadata back to the "
+                 "source, which UEC 1.0.3 section 4.1 explicitly excludes; use "
+                 "ftd for UET-conformant trimming\n";
+  }
   if (data_loss_rng_stream >
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
@@ -787,6 +862,16 @@ void SetConfig() {
   Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
   Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold",
                      BooleanValue(dynamicth));
+
+  // Give trimmed packets their own TC_med scheduling tier only when trimming is
+  // enabled, so baseline runs keep the original two-tier egress discipline.
+  if (packet_trim_mode_value() !=
+      static_cast<uint32_t>(PacketTrimMode::Disabled)) {
+    Config::SetDefault("ns3::BEgressQueue::MediumPriorityQueue",
+                       UintegerValue(packet_trim_queue));
+    Config::SetDefault("ns3::BEgressQueue::MediumPriorityWeight",
+                       UintegerValue(packet_trim_queue_weight));
+  }
 
   // set int_multi
   IntHop::multi = int_multi;
@@ -883,6 +968,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
         sw->SetAttribute("PacketTrimMode",
                  UintegerValue(packet_trim_mode_value()));
+      sw->SetAttribute("TrimmedQueueIndex", UintegerValue(packet_trim_queue));
+      sw->SetAttribute("MinTrimSize", UintegerValue(min_trim_size));
+      sw->SetAttribute("LastHopTrimCodepoint",
+                       BooleanValue(packet_trim_lasthop != 0));
       sw->TraceConnectWithoutContext(
           "SwitchDrop", MakeBoundCallback(&get_switch_drop,
                                             transport_event_file, sw));

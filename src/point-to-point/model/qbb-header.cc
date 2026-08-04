@@ -58,6 +58,12 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_TRIM_FTD);
 	}
+	void qbbHeader::SetTrimLastHop(bool lastHop){
+		if (lastHop)
+			flags |= 1 << FLAG_TRIM_LASTHOP;
+		else
+			flags &= ~(1 << FLAG_TRIM_LASTHOP);
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -91,6 +97,9 @@ namespace ns3 {
 	}
 	bool qbbHeader::IsTrimFtd() const{
 		return (flags >> FLAG_TRIM_FTD) & 1;
+	}
+	bool qbbHeader::IsTrimLastHop() const{
+		return (flags >> FLAG_TRIM_LASTHOP) & 1;
 	}
 
 	TypeId

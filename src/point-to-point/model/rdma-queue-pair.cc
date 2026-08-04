@@ -40,6 +40,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_trim_notifications = 0;
 	m_trim_ftd_repairs = 0;
 	m_trim_bts_notifications = 0;
+	m_trim_lasthop_notifications = 0;
 	m_trim_recovery_events = 0;
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;

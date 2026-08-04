@@ -42,6 +42,20 @@ namespace ns3 {
 				DoubleValue(1000.0 * 1024 * 1024),
 				MakeDoubleAccessor(&BEgressQueue::m_maxBytes),
 				MakeDoubleChecker<double>())
+			.AddAttribute("MediumPriorityQueue",
+				"Index of the TC_med queue, served with strict priority below queue 0 "
+				"(TC_high) and above the round-robin TC_low queues. qCnt disables the tier.",
+				UintegerValue(BEgressQueue::qCnt),
+				MakeUintegerAccessor(&BEgressQueue::m_medPriorityQueue),
+				MakeUintegerChecker<uint32_t>(0, BEgressQueue::qCnt))
+			.AddAttribute("MediumPriorityWeight",
+				"Percent of egress bandwidth TC_med may consume when TC_low has traffic. "
+				"UEC 1.0.3 section 4.1 recommends WDRR at 25% and warns that an "
+				"unrestricted trimmed class can cause congestion collapse; 100 restores "
+				"strict priority over TC_low.",
+				UintegerValue(25),
+				MakeUintegerAccessor(&BEgressQueue::m_medPriorityWeight),
+				MakeUintegerChecker<uint32_t>(1, 100))
 			.AddTraceSource ("BeqEnqueue", "Enqueue a packet in the BEgressQueue. Multiple queue",
 					MakeTraceSourceAccessor (&BEgressQueue::m_traceBeqEnqueue),
 					"ns3::BeqDequeue::BEgressQueue")
@@ -60,6 +74,9 @@ namespace ns3 {
 		NS_LOG_FUNCTION_NOARGS();
 		m_bytesInQueueTotal = 0;
 		m_rrlast = 0;
+		m_medPriorityQueue = qCnt;
+		m_medPriorityWeight = 25;
+		m_medDeficit = 0;
 		for (uint32_t i = 0; i < fCnt; i++)
 		{
 			m_bytesInQueue[i] = 0;
@@ -166,6 +183,50 @@ namespace ns3 {
 		return true;
 	}
 
+	// Weighted deficit between TC_med and the TC_low aggregate. Serving TC_med
+	// costs (100 - weight) per byte and serving TC_low earns weight per byte, so
+	// the steady state gives TC_med exactly `weight` percent of the link.
+	//
+	// The deficit is clamped to roughly one MTU of imbalance in either direction.
+	// Without the clamp, an idle TC_low period would let TC_med bank unbounded
+	// credit (or debt), and the correction would land exactly when congestion
+	// resumes — delaying loss notification at the worst moment. Bounding it keeps
+	// the scheduler memoryless beyond a single round.
+	bool BEgressQueue::MedWithinShare() const
+	{
+		if (m_medPriorityWeight >= 100)
+		{
+			return true; // strict priority over TC_low
+		}
+		return m_medDeficit >= 0;
+	}
+
+	void BEgressQueue::AccountWeightedShare(uint32_t qIndex, uint32_t bytes)
+	{
+		if (m_medPriorityQueue >= qCnt || m_medPriorityWeight >= 100)
+		{
+			return;
+		}
+		const int64_t weight = int64_t(m_medPriorityWeight);
+		if (qIndex == m_medPriorityQueue)
+		{
+			m_medDeficit -= int64_t(bytes) * (100 - weight);
+		}
+		else
+		{
+			m_medDeficit += int64_t(bytes) * weight;
+		}
+		const int64_t kMaxImbalance = int64_t(9000) * 100; // ~one jumbo frame
+		if (m_medDeficit > kMaxImbalance)
+		{
+			m_medDeficit = kMaxImbalance;
+		}
+		else if (m_medDeficit < -kMaxImbalance)
+		{
+			m_medDeficit = -kMaxImbalance;
+		}
+	}
+
 	Ptr<Packet>
 		BEgressQueue::DoDequeueRR(bool paused[]) //this is for switch only
 	{
@@ -186,17 +247,42 @@ namespace ns3 {
 		}
 		else
 		{
-			if (!found)
+			// TC_med (UEC 1.0.3 section 4.1.4.1) carries trimmed packets. It is
+			// drained ahead of the round-robin TC_low data queues so trimmed
+			// packets "bypass data packets and arrive quickly at the
+			// destination", but section 4.1 also warns that unrestricted header
+			// bandwidth causes congestion collapse and recommends capping the
+			// trimmed share (WDRR at 25%, or fair-queueing at no more than 50%).
+			// TC_med is therefore weighted against the TC_low aggregate rather
+			// than given strict priority.
+			const bool medReady = m_medPriorityQueue < qCnt &&
+				!paused[m_medPriorityQueue] &&
+				m_queues[m_medPriorityQueue]->GetNPackets() > 0;
+
+			bool lowFound = false;
+			uint32_t lowIndex = 0;
+			for (uint32_t i = 1; i <= qCnt; i++)
 			{
-				for (qIndex = 1; qIndex <= qCnt; qIndex++)
+				const uint32_t candidate = (i + m_rrlast) % qCnt;
+				if (candidate == m_medPriorityQueue)
+					continue;
+				if (!paused[candidate] && m_queues[candidate]->GetNPackets() > 0)  //round robin
 				{
-					if (!paused[(qIndex + m_rrlast) % qCnt] && m_queues[(qIndex + m_rrlast) % qCnt]->GetNPackets() > 0)  //round robin
-					{
-						found = true;
-						break;
-					}
+					lowFound = true;
+					lowIndex = candidate;
+					break;
 				}
-				qIndex = (qIndex + m_rrlast) % qCnt;
+			}
+
+			if (medReady && (!lowFound || MedWithinShare()))
+			{
+				found = true;
+				qIndex = m_medPriorityQueue;
+			}
+			else if (lowFound)
+			{
+				found = true;
+				qIndex = lowIndex;
 			}
 		}
 		if (found)
@@ -206,6 +292,10 @@ namespace ns3 {
 			m_bytesInQueueTotal -= p->GetSize();
 			m_bytesInQueue[qIndex] -= p->GetSize();
 			if (qIndex != 0)
+			{
+				AccountWeightedShare(qIndex, p->GetSize());
+			}
+			if (qIndex != 0 && qIndex != m_medPriorityQueue)
 			{
 				m_rrlast = qIndex;
 			}

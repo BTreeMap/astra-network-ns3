@@ -390,6 +390,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		head.SetSource(Ipv4Address(ch.dip));
 		head.SetProtocol(x == 1 ? 0xFC : 0xFD); //ack=0xFC nack=0xFD
 		head.SetTtl(64);
+		// UEC 1.0.3 Table 3-76: PDS ACKs and NACKs use DSCP_CONTROL (TC_high) and
+		// MUST NOT be marked as trimmable.
+		head.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
 		head.SetPayloadSize(newp->GetSize());
 		head.SetIdentification(rxQp->m_ipid++);
 
@@ -504,10 +507,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 }
 
 int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
+	// UEC 1.0.3 section 3.5.15.1: "Trimmed packet MUST be recognized based on
+	// the ip.dscp field". The IP and UDP lengths of a trimmed packet MUST NOT be
+	// verified, and the packet MUST NOT reach normal request processing.
+	if (IsUetTrimmedDscp(ch.GetIpv4Dscp())){
+		return ReceiveTrim(p, ch);
+	}
 	if (ch.l3Prot == 0x11){ // UDP
 		ReceiveUdp(p, ch);
-	}else if (ch.l3Prot == kUecTrimNotificationProtocol ||
-			ch.l3Prot == kUecTrimRepairProtocol){
+	}else if (ch.l3Prot == kUecTrimRepairProtocol){
 		ReceiveTrim(p, ch);
 	}else if (ch.l3Prot == 0xFF){ // CNP
 		ReceiveCnp(p, ch);
@@ -519,30 +527,36 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 	return 0;
 }
 
-void RdmaHw::SendTrimRepair(const CustomHeader &ch){
+// UEC 1.0.3 Table 3-61: a trimmed RUD/ROD/RUDI Request MUST produce a NACK with
+// pds.nack_code UET_TRIMMED or UET_TRIMMED_LASTHOP. The NACK is a control packet
+// (DSCP_CONTROL / TC_high) and carries only the identity of the lost packet.
+void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
+		uint32_t seq, uint32_t payloadSize, bool lastHop){
 	qbbHeader repair;
-	repair.SetSeq(ch.ack.seq);
-	repair.SetPG(ch.ack.pg);
-	repair.SetSport(ch.ack.sport);
-	repair.SetDport(ch.ack.dport);
-	repair.SetTrimPayloadSize(ch.ack.trim_payload_size);
+	repair.SetSeq(seq);
+	repair.SetPG(pg);
+	repair.SetSport(sport);
+	repair.SetDport(dport);
+	repair.SetTrimPayloadSize(payloadSize);
 	repair.SetTrimFtd(true);
-	repair.SetIntHeader(ch.ack.ih);
+	repair.SetTrimLastHop(lastHop);
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
 
 	Ipv4Header ipHeader;
-	ipHeader.SetSource(Ipv4Address(ch.dip));
-	ipHeader.SetDestination(Ipv4Address(ch.sip));
+	ipHeader.SetSource(Ipv4Address(sourceIp));
+	ipHeader.SetDestination(Ipv4Address(destinationIp));
 	ipHeader.SetProtocol(kUecTrimRepairProtocol);
+	ipHeader.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
 	ipHeader.SetPayloadSize(packet->GetSize());
 	ipHeader.SetTtl(64);
 	ipHeader.SetIdentification(ch.ipid);
 	packet->AddHeader(ipHeader);
 	AddHeader(packet, 0x800);
 
-	auto route = m_rtTable.find(ch.sip);
+	auto route = m_rtTable.find(destinationIp);
 	if (route == m_rtTable.end() || route->second.empty()) {
 		return;
 	}
@@ -564,6 +578,7 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		return;
 	}
 
+	const bool lastHop = (ch.ack.flags >> qbbHeader::FLAG_TRIM_LASTHOP) & 1;
 	qp->m_recovery_retries++;
 	qp->m_trim_notifications++;
 	qp->m_trimmed_payload_bytes += ch.ack.trim_payload_size;
@@ -572,8 +587,14 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	} else {
 		qp->m_trim_bts_notifications++;
 	}
+	if (lastHop) {
+		qp->m_trim_lasthop_notifications++;
+	}
 	qp->m_trim_recovery_events++;
-	if (m_cc_mode == 1) {
+	// UEC 1.0.3 section 3.6.4.4: a DSCP_TRIMMED_LASTHOP packet "is not used as a
+	// congestion signal to NSCC" and is not a load-balancing input, because no
+	// alternate path avoids incast at the destination. Loss recovery still runs.
+	if (m_cc_mode == 1 && !lastHop) {
 		cnp_received_mlx(qp);
 	}
 	RecoverQueue(qp);
@@ -584,15 +605,24 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 
 int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	(void)p;
-	if (ch.l3Prot == kUecTrimNotificationProtocol &&
-		((ch.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1)){
-		// The destination received loss metadata, not payload. It asks the
-		// sender to repair without changing ReceiverNextExpectedSeq.
-		SendTrimRepair(ch);
+	// A trimmed data packet reaching its destination. UEC 1.0.3 section 3.5.8.2
+	// step 2 and section 3.5.15.1: send a NACK, do not advance any receive state,
+	// do not establish a PDC, and drop the packet.
+	if (ch.l3Prot == 0x11){
+		const uint32_t udpHeaderBytes = CustomHeader::GetUdpHeaderSize();
+		// The UDP length field survives trimming unmodified, so it still reports
+		// the size of the original packet that was dropped.
+		const uint32_t originalPayload = ch.udp.payload_size > udpHeaderBytes
+			? ch.udp.payload_size - udpHeaderBytes : 0;
+		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.seq, originalPayload,
+			ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop);
 		return 0;
 	}
 
-	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.sport, ch.ack.pg);
+	// Back-to-sender notification (not a UEC 1.0.3 mechanism) arriving directly
+	// at the original sender, or the NACK returned by the destination.
+	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.dport, ch.ack.pg);
 	if (!qp || qp->IsFailed()) {
 		return 0;
 	}
@@ -770,7 +800,11 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetProtocol (0x11);
 	ipHeader.SetPayloadSize (p->GetSize());
 	ipHeader.SetTtl (64);
+	// UEC 1.0.3 section 3.6.4.7.1 Table 3-76: PDS Requests carry DSCP_TRIMMABLE
+	// so that switches know the packet may be trimmed. The ECN bits stay clear;
+	// a congested switch sets them independently of the codepoint.
 	ipHeader.SetTos (0);
+	ipHeader.SetDscp (static_cast<Ipv4Header::DscpType>(kUetDscpTrimmable));
 	ipHeader.SetIdentification (qp->m_ipid);
 	p->AddHeader(ipHeader);
 	// add ppp header

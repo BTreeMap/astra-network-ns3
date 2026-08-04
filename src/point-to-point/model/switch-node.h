@@ -15,17 +15,28 @@ enum class SwitchDropReason : uint32_t {
 	Route = 1,
 	Admission = 2,
 	EgressQueue = 3,
+	// UEC 1.0.3 section 4.1: a trimmed packet "MUST obey buffer admission rules
+	// for the queue associated with DSCP_TRIMMED"; on failure "the normal
+	// procedure for queue overflow should be followed", i.e. it is dropped.
+	TrimmedQueue = 4,
 };
 
 enum class PacketTrimMode : uint32_t {
 	Disabled = 0,
+	// UEC 1.0.3 section 4.1: the trimmed packet is forwarded to the destination.
 	ForwardToDestination,
+	// Back-to-sender notification. UEC 1.0.3 section 4.1 explicitly excludes
+	// this: "Sending a trimmed packet back to the source ... is not part of this
+	// specification". Retained as a non-UET research mode only.
 	BackToSender,
 };
 
 enum class PacketTrimTrigger : uint32_t {
 	Admission = 1,
 	EgressQueue,
+	// DSCP_TRIMMED_LAST_HOP variants (UEC 1.0.3 section 4.1.4.1).
+	AdmissionLastHop,
+	EgressQueueLastHop,
 };
 
 class SwitchNode : public Node{
@@ -50,13 +61,21 @@ protected:
 
 	uint32_t m_ackHighPrio; // set high priority for ACK/NACK
 	uint32_t m_packetTrimMode;
+	uint32_t m_trimmedQueueIndex; // TC_med egress queue for DSCP_TRIMMED
+	uint32_t m_minTrimSize;       // MIN_TRIM_SIZE, in IP payload bytes
+	bool m_lastHopTrimCodepoint;  // emit DSCP_TRIMMED_LAST_HOP on TOR downlinks
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);
-	void SendToDev(Ptr<Packet>p, CustomHeader &ch);
-	bool SendTrimNotification(const CustomHeader &ch, uint32_t payloadSize,
+	bool SendToDev(Ptr<Packet>p, CustomHeader &ch);
+	bool TrimAndForward(Ptr<Packet> p, CustomHeader &ch, int outDev,
 		PacketTrimTrigger trigger);
+	bool TrimInPlace(Ptr<Packet> p, const CustomHeader &ch, bool lastHop);
+	bool SendTrimNotification(Ptr<const Packet> original, const CustomHeader &ch,
+		uint32_t payloadSize, bool lastHop, PacketTrimTrigger trigger);
+	bool IsLastHopTo(uint32_t outDev) const;
 	bool PacketTrimEnabledFor(const CustomHeader &ch) const;
+	uint32_t QueueIndexFor(const CustomHeader &ch) const;
 	static uint32_t EcmpHash(const uint8_t* key, size_t len, uint32_t seed);
 	void CheckAndSendPfc(uint32_t inDev, uint32_t qIndex);
 	void CheckAndSendResume(uint32_t inDev, uint32_t qIndex);

@@ -88,7 +88,9 @@ public:
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
 	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch,
 		bool isFtdRepair);
-	void SendTrimRepair(const CustomHeader &ch);
+	void SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
+		uint32_t seq, uint32_t payloadSize, bool lastHop);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);

@@ -25,7 +25,8 @@ public:
  
   enum {
     FLAG_CNP = 0,
-    FLAG_TRIM_FTD = 1
+    FLAG_TRIM_FTD = 1,
+    FLAG_TRIM_LASTHOP = 2
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -43,6 +44,7 @@ public:
   void SetCnp();
   void SetTrimPayloadSize(uint32_t payloadSize);
   void SetTrimFtd(bool forwardToDestination);
+  void SetTrimLastHop(bool lastHop);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -58,6 +60,7 @@ public:
   uint8_t GetCnp() const;
   uint32_t GetTrimPayloadSize() const;
   bool IsTrimFtd() const;
+  bool IsTrimLastHop() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;

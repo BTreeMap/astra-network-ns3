@@ -469,7 +469,10 @@ namespace ns3 {
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
 		packet->PeekHeader(ch);
-		const bool isDataPlane = ch.l3Prot == 0x11;
+		// A trimmed packet carries no payload; it is loss notification, so it is
+		// not subject to the configured data-plane impairment and is accounted on
+		// the control plane instead.
+		const bool isDataPlane = ch.l3Prot == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
 		if (isDataPlane) {
 			m_traceDataPlaneAttempt(packet, ch.l3Prot);
 			if (DataLossScopeMatches(ch) && m_dataLossErrorModel->IsCorrupt(packet)) {

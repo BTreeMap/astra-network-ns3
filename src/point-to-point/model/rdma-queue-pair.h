@@ -28,6 +28,7 @@ public:
 	uint32_t m_trim_notifications;
 	uint32_t m_trim_ftd_repairs;
 	uint32_t m_trim_bts_notifications;
+	uint32_t m_trim_lasthop_notifications;
 	uint32_t m_trim_recovery_events;
 	uint32_t m_stale_trim_notifications;
 	uint32_t m_recovery_retries;
