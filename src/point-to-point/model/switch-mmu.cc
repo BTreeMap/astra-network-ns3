@@ -33,6 +33,7 @@ namespace ns3 {
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
 		memset(egress_bytes, 0, sizeof(egress_bytes));
+		memset(egress_threshold, 0, sizeof(egress_threshold));
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
@@ -44,8 +45,13 @@ namespace ns3 {
 		}
 		return true;
 	}
+	// UEC 1.0.3 section 4.1: a packet is admitted while its egress queue is below
+	// that queue's drop threshold. Trimmable and trimmed classes carry separate
+	// thresholds so a shallow data queue can coexist with a bounded trimmed queue.
 	bool SwitchMmu::CheckEgressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
-		return true;
+		if (qIndex >= qCnt || egress_threshold[qIndex] == 0)
+			return true;
+		return egress_bytes[port][qIndex] + psize <= egress_threshold[qIndex];
 	}
 	void SwitchMmu::UpdateIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		uint32_t new_bytes = ingress_bytes[port][qIndex] + psize;
@@ -130,5 +136,9 @@ namespace ns3 {
 	}
 	void SwitchMmu::ConfigBufferSize(uint32_t size){
 		buffer_size = size;
+	}
+	void SwitchMmu::ConfigEgressThreshold(uint32_t qIndex, uint32_t bytes){
+		if (qIndex < qCnt)
+			egress_threshold[qIndex] = bytes;
 	}
 }

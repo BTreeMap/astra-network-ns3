@@ -64,6 +64,7 @@ protected:
 	uint32_t m_trimmedQueueIndex; // TC_med egress queue for DSCP_TRIMMED
 	uint32_t m_minTrimSize;       // MIN_TRIM_SIZE, in IP payload bytes
 	bool m_lastHopTrimCodepoint;  // emit DSCP_TRIMMED_LAST_HOP on TOR downlinks
+	bool m_pfcEnabled;            // generate PFC on ingress pressure
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);

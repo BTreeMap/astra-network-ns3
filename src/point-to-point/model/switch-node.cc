@@ -64,6 +64,13 @@ TypeId SwitchNode::GetTypeId (void)
 			BooleanValue(true),
 			MakeBooleanAccessor(&SwitchNode::m_lastHopTrimCodepoint),
 			MakeBooleanChecker())
+	.AddAttribute("PfcEnabled",
+			"Generate PFC pause frames on ingress pressure. UEC 1.0.3 section "
+			"3.6.4.5: PFC SHOULD NOT be used anywhere in a best-effort network, "
+			"which is the mode packet trimming is designed for.",
+			BooleanValue(true),
+			MakeBooleanAccessor(&SwitchNode::m_pfcEnabled),
+			MakeBooleanChecker())
 	.AddAttribute("MaxRtt",
 			"Max Rtt of the network",
 			UintegerValue(9000),
@@ -86,6 +93,7 @@ SwitchNode::SwitchNode(){
 	m_trimmedQueueIndex = 2;
 	m_minTrimSize = 24;
 	m_lastHopTrimCodepoint = true;
+	m_pfcEnabled = true;
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
 		for (uint32_t j = 0; j < pCnt; j++)
@@ -299,6 +307,8 @@ bool SwitchNode::SendTrimNotification(Ptr<const Packet> original,
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
+	if (!m_pfcEnabled)
+		return;
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldPause(inDev, qIndex)){
 		device->SendPfc(qIndex, 0);
@@ -306,6 +316,8 @@ void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
 	}
 }
 void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
+	if (!m_pfcEnabled)
+		return;
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldResume(inDev, qIndex)){
 		device->SendPfc(qIndex, 1);

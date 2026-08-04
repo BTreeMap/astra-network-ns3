@@ -84,6 +84,15 @@ uint32_t packet_trim_lasthop = 1;
 // recommends WDRR at 25% and warns that an unrestricted trimmed class can drive
 // congestion collapse.
 uint32_t packet_trim_queue_weight = 25;
+// UEC 1.0.3 section 3.6.4.5: "PFC SHOULD NOT be used anywhere in a best-effort
+// network." Trimming exists to replace lossless operation, so a trimming fabric
+// disables PFC and zeroes the PFC headroom that would otherwise act as a second
+// buffer no pause mechanism ever drains.
+uint32_t enable_pfc = 1;
+// Per-queue egress drop thresholds in bytes (0 = unbounded). These are the
+// queue_trimmable and queue_trimmed drop thresholds of section 4.1.
+uint32_t data_queue_bytes = 0;
+uint32_t trimmed_queue_bytes = 0;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -683,6 +692,12 @@ bool ReadConf(string network_configuration) {
 	  conf >> packet_trim_lasthop;
 	} else if (key.compare("PACKET_TRIM_QUEUE_WEIGHT") == 0) {
 	  conf >> packet_trim_queue_weight;
+	} else if (key.compare("ENABLE_PFC") == 0) {
+	  conf >> enable_pfc;
+	} else if (key.compare("DATA_QUEUE_BYTES") == 0) {
+	  conf >> data_queue_bytes;
+	} else if (key.compare("TRIMMED_QUEUE_BYTES") == 0) {
+	  conf >> trimmed_queue_bytes;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -837,6 +852,28 @@ bool ReadConf(string network_configuration) {
     std::cerr << "PACKET_TRIM_QUEUE_WEIGHT must be a percentage in [1,100]\n";
     return false;
   }
+  // Headroom only exists to absorb packets already in flight when a PAUSE is
+  // sent. Without PFC nothing ever pauses, so a nonzero headroom is dead buffer
+  // that must fill before any packet can be trimmed or dropped.
+  if (enable_pfc == 0 && headroom_factor != 0) {
+    std::cerr << "HEADROOM_FACTOR must be 0 when ENABLE_PFC is 0; PFC headroom "
+                 "is unreachable buffer in a best-effort fabric\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      enable_pfc != 0) {
+    std::cerr << "packet trimming requires ENABLE_PFC 0; UEC 1.0.3 section "
+                 "3.6.4.5 excludes PFC from best-effort networks\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      data_queue_bytes == 0) {
+    std::cerr << "packet trimming requires a bounded DATA_QUEUE_BYTES; an "
+                 "unbounded egress queue can never reject a packet\n";
+    return false;
+  }
   if (packet_trim_mode_value() ==
       static_cast<uint32_t>(PacketTrimMode::BackToSender)) {
     std::cerr << "warning: PACKET_TRIM_MODE bts sends trim metadata back to the "
@@ -860,6 +897,8 @@ void SetConfig() {
 
   Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
   Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
+  Config::SetDefault("ns3::QbbNetDevice::QbbEnabled",
+                     BooleanValue(enable_pfc != 0));
   Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold",
                      BooleanValue(dynamicth));
 
@@ -972,6 +1011,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       sw->SetAttribute("MinTrimSize", UintegerValue(min_trim_size));
       sw->SetAttribute("LastHopTrimCodepoint",
                        BooleanValue(packet_trim_lasthop != 0));
+      sw->SetAttribute("PfcEnabled", BooleanValue(enable_pfc != 0));
       sw->TraceConnectWithoutContext(
           "SwitchDrop", MakeBoundCallback(&get_switch_drop,
                                             transport_event_file, sw));
@@ -1098,6 +1138,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       }
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
       sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
+      // TC_low carries data on every configured priority group; TC_med carries
+      // trimmed packets. Queue 0 (TC_high, control) stays unbounded.
+      for (uint32_t q = 1; q < 8; q++) {
+        sw->m_mmu->ConfigEgressThreshold(q, data_queue_bytes);
+      }
+      sw->m_mmu->ConfigEgressThreshold(packet_trim_queue, trimmed_queue_bytes);
       sw->m_mmu->node_id = sw->GetId();
     }
   }
