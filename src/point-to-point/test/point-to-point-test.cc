@@ -283,6 +283,9 @@ class UecTrimSwitchTest : public TestCase
         queue->SetAttribute("MaxBytes", DoubleValue(100.0));
         output->SetQueue(queue);
         sw->AddDevice(output);
+        // A plain Node has node type 0, so this egress port is a host downlink
+        // and every trim taken here is a last-hop trim (UEC 1.0.3 section
+        // 4.1.4.1).
         Ptr<Node> peerNode = CreateObject<Node>();
         Ptr<QbbNetDevice> peer = CreateObject<QbbNetDevice>();
         peerNode->AddDevice(peer);
@@ -308,6 +311,7 @@ class UecTrimSwitchTest : public TestCase
         UdpHeader udp;
         udp.SetSourcePort(10000);
         udp.SetDestinationPort(10001);
+        udp.ForcePayloadSize(CustomHeader::GetUdpHeaderSize() + kPayloadSize);
         dataPacket->AddHeader(udp);
         Ipv4Header ip;
         ip.SetSource(sender);
@@ -350,14 +354,14 @@ class UecTrimSwitchTest : public TestCase
                 "trim metadata must contain the original payload bytes");
             NS_TEST_EXPECT_MSG_EQ(
                 m_trimTrigger,
-                static_cast<uint32_t>(PacketTrimTrigger::EgressQueue),
-                "queue capacity rejection must be identified as egress trim");
+                static_cast<uint32_t>(PacketTrimTrigger::EgressQueueLastHop),
+                "queue capacity rejection on a host downlink is a last-hop trim");
             NS_TEST_EXPECT_MSG_EQ(m_trimForward,
                                   expectedForward,
                                   "trim metadata must preserve the configured direction");
             NS_TEST_EXPECT_MSG_EQ(
-                m_trimDscp, kUetDscpTrimmed,
-                "a trimmed packet must carry the DSCP_TRIMMED codepoint");
+                m_trimDscp, kUetDscpTrimmedLastHop,
+                "a trim on a host downlink carries DSCP_TRIMMED_LAST_HOP");
             if (expectedForward)
             {
                 NS_TEST_EXPECT_MSG_LT(

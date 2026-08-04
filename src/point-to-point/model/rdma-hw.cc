@@ -792,6 +792,12 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	UdpHeader udpHeader;
 	udpHeader.SetDestinationPort (qp->dport);
 	udpHeader.SetSourcePort (qp->sport);
+	// Trimming truncates the payload but leaves the UDP length field unmodified
+	// (UEC 1.0.3 section 4.1), which is how the destination learns how many
+	// payload bytes were discarded. ns-3 otherwise derives that field from the
+	// live buffer extent, which does not survive truncation, so write it
+	// explicitly.
+	udpHeader.ForcePayloadSize (CustomHeader::GetUdpHeaderSize() + payload_size);
 	p->AddHeader (udpHeader);
 	// add ipv4 header
 	Ipv4Header ipHeader;

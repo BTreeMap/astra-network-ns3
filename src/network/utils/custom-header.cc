@@ -30,7 +30,7 @@ NS_LOG_COMPONENT_DEFINE ("CustomHeader");
 NS_OBJECT_ENSURE_REGISTERED (CustomHeader);
 
 CustomHeader::CustomHeader ()
-  : brief(1), headerType(L3_Header | L4_Header), 
+  : brief(0), headerType(L3_Header | L4_Header), 
 	getInt(1),
 	// ppp header
 	pppProto (0),
@@ -47,7 +47,7 @@ CustomHeader::CustomHeader ()
 {
 }
 CustomHeader::CustomHeader (uint32_t _headerType)
-  : brief(1), headerType(_headerType), 
+  : brief(0), headerType(_headerType), 
 	getInt(1),
 	// ppp header
 	pppProto (0),
@@ -287,6 +287,10 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 		  // udp header
 		  udp.sport = i.ReadNtohU16 ();
 		  udp.dport = i.ReadNtohU16 ();
+		  // Both branches advance the same 4 bytes, so l4Size is unaffected.
+		  // The UDP length field is load-bearing for packet trimming: it is the
+		  // only record of the original payload size that survives truncation
+		  // (UEC 1.0.3 section 4.1 leaves it unmodified).
 		  if (brief){
 			  i.Next(4);
 		  }else{
