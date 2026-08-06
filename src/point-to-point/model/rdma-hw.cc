@@ -568,13 +568,16 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		qp->m_stale_trim_notifications++;
 		return;
 	}
-	if (qp->m_recovery_retries >= m_max_retransmission_retries){
-		QpFail(qp, static_cast<uint32_t>(RdmaFailureReason::TrimRetryExhausted));
-		return;
-	}
-
+	// A trim notification never consumes the retry budget. Like a NACK, it
+	// is proof the path is alive: the switch chose to report congestion
+	// instead of staying silent, which is the entire point of trimming.
+	// The budget bounds consecutive *silent* retransmission timeouts, the
+	// only signal consistent with a dead path. Counting notifications here
+	// would fail a queue pair at the sender's own send rate during any
+	// sustained blockade — e.g. while a shared-buffer switch fair-shares
+	// its pool against an incast burst — turning engineered congestion
+	// into spurious transport failure.
 	const bool lastHop = (ch.ack.flags >> qbbHeader::FLAG_TRIM_LASTHOP) & 1;
-	qp->m_recovery_retries++;
 	qp->m_trim_notifications++;
 	qp->m_trimmed_payload_bytes += ch.ack.trim_payload_size;
 	if (isFtdRepair) {
