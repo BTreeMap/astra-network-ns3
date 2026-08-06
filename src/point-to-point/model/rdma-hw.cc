@@ -361,16 +361,11 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->m_ecn_source.total++;
 	rxQp->m_milestone_rx = m_ack_interval;
 
+	// No logging on the non-ACK paths: behind a trim- or drop-induced gap,
+	// go-back-N delivers up to a full window of out-of-order packets, so a
+	// per-packet line here floods stdout exactly when the fabric is doing
+	// what a congestion experiment asks of it.
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
-
-	if(x !=1 && x!=2){
-		std::cout << Simulator::Now().GetNanoSeconds() << " Rx ";
-		Ipv4Address(ch.sip).Print(std::cout);
-		std::cout << " " << ch.udp.sport << " ";
-		Ipv4Address(ch.dip).Print(std::cout);
-		std::cout << " " << ch.udp.dport << " " << ch.udp.seq << " " << ch.udp.pg << " " << p->GetSize() << " " << payload_size;
-		std::cout << " ReceiverCheckSeq " << x << std::endl;
-	}
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		qbbHeader seqh;
