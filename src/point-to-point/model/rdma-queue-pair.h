@@ -8,6 +8,7 @@
 #include <ns3/event-id.h>
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
+#include <map>
 #include <vector>
 
 namespace ns3 {
@@ -34,6 +35,9 @@ public:
 	uint32_t m_recovery_retries;
 	uint32_t m_failure_reason;
 	bool m_failed;
+	// Selective repair: merged byte ranges awaiting retransmission, always
+	// clamped above snd_una. GetNxtPacket serves these before new data.
+	std::map<uint64_t, uint64_t> m_repair_ranges;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -107,6 +111,10 @@ public:
 	void SetVarWin(bool v);
 	void SetAppNotifyCallback(Callback<void> notifyAppFinish);
 	void SetAppSentCallback(Callback<void> notifyAppSent);
+	void AddRepairRange(uint64_t start, uint64_t end);
+	uint64_t TakeRepairSegment(uint64_t max_bytes, uint64_t &start);
+	void DropAcknowledgedRepairs();
+	uint64_t RepairBytesLeft();
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -143,10 +151,14 @@ public:
 	int32_t m_milestone_rx;
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
+	// Out-of-order payload ranges accepted under selective retransmission.
+	std::map<uint64_t, uint64_t> m_ooo_ranges;
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);
+	void AddOutOfOrderRange(uint64_t start, uint64_t end);
+	uint64_t AbsorbContiguousFrom(uint64_t expected);
 };
 
 class RdmaQueuePairGroup : public Object {

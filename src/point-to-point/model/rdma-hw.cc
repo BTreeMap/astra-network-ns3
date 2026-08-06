@@ -64,6 +64,13 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_max_retransmission_retries),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("SelectiveRetransmission",
+				"Retransmit exactly the reported trimmed or missing byte ranges "
+				"and accept out-of-order payload at the receiver, instead of "
+				"go-back-N. Timeout recovery stays go-back-N as the fallback.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_selective_retransmission),
+				MakeBooleanChecker())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -475,8 +482,20 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			return 0;
 		}
 	}
-	if (ch.l3Prot == 0xFD) // NACK
-		RecoverQueue(qp);
+	if (ch.l3Prot == 0xFD){ // NACK
+		if (m_selective_retransmission){
+			// The NACK names the gap head (its cumulative sequence) but not
+			// the gap's extent, so repair one packet at the head; successive
+			// NACKs walk the gap and trim notifications carry exact ranges.
+			uint64_t gap_start = qp->snd_una;
+			uint64_t gap_end = gap_start + m_mtu;
+			if (gap_end > qp->m_size)
+				gap_end = qp->m_size;
+			qp->AddRepairRange(gap_start, gap_end);
+		}else{
+			RecoverQueue(qp);
+		}
+	}
 
 	// handle cnp
 	if (cnp){
@@ -595,7 +614,16 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	if (m_cc_mode == 1 && !lastHop) {
 		cnp_received_mlx(qp);
 	}
-	RecoverQueue(qp);
+	if (m_selective_retransmission){
+		// The notification names the exact trimmed byte range, so repair
+		// only that range instead of rewinding the whole window. The
+		// receiver accepts the out-of-order remainder, so nothing else
+		// needs resending.
+		qp->m_recovery_events++;
+		qp->AddRepairRange(trimStart, trimEnd);
+	}else{
+		RecoverQueue(qp);
+	}
 	const uint32_t nicIdx = GetNicIdxOfQp(qp);
 	m_nic[nicIdx].dev->TriggerTransmit();
 	ArmRetransmissionTimeout(qp);
@@ -631,9 +659,17 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
 	uint32_t expected = q->ReceiverNextExpectedSeq;
 	if (seq == expected){
-		q->ReceiverNextExpectedSeq = expected + size;
-		if (q->ReceiverNextExpectedSeq >= q->m_milestone_rx){
-			q->m_milestone_rx += m_ack_interval;
+		uint64_t advanced = static_cast<uint64_t>(expected) + size;
+		if (m_selective_retransmission){
+			// Filling the gap head releases every contiguous out-of-order
+			// range behind it, so the cumulative sequence can jump.
+			advanced = q->AbsorbContiguousFrom(advanced);
+		}
+		q->ReceiverNextExpectedSeq = static_cast<uint32_t>(advanced);
+		if (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx)){
+			// The absorbed jump can cross several milestones at once.
+			while (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx))
+				q->m_milestone_rx += m_ack_interval;
 			return 1; //Generate ACK
 		}else if (q->ReceiverNextExpectedSeq % m_chunk == 0){
 			return 1;
@@ -641,11 +677,15 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			return 5;
 		}
 	} else if (seq > expected) {
+		if (m_selective_retransmission){
+			// Accept the out-of-order payload; only its gap needs repair.
+			q->AddOutOfOrderRange(seq, static_cast<uint64_t>(seq) + size);
+		}
 		// Generate NACK.
 		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected){
 			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
 			q->m_lastNACK = expected;
-			if (m_backto0){
+			if (m_backto0 && !m_selective_retransmission){
 				q->ReceiverNextExpectedSeq = q->ReceiverNextExpectedSeq / m_chunk*m_chunk;
 			}
 			return 2;
@@ -777,13 +817,29 @@ void RdmaHw::RedistributeQp(){
 Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	if (qp->IsFailed())
 		return 0;
-	uint32_t payload_size = qp->GetBytesLeft();
-	if (m_mtu < payload_size)
-		payload_size = m_mtu;
+	// Selective repairs are served before new data: the receiver is waiting
+	// on exactly these bytes to advance its cumulative sequence.
+	uint64_t seq = qp->snd_nxt;
+	uint32_t payload_size = 0;
+	bool is_repair = false;
+	if (m_selective_retransmission){
+		uint64_t repair_start = 0;
+		const uint64_t repair_size = qp->TakeRepairSegment(m_mtu, repair_start);
+		if (repair_size > 0){
+			seq = repair_start;
+			payload_size = static_cast<uint32_t>(repair_size);
+			is_repair = true;
+		}
+	}
+	if (!is_repair){
+		const uint64_t tail =
+			qp->m_size >= qp->snd_nxt ? qp->m_size - qp->snd_nxt : 0;
+		payload_size = tail > m_mtu ? m_mtu : static_cast<uint32_t>(tail);
+	}
 	Ptr<Packet> p = Create<Packet> (payload_size);
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
-	seqTs.SetSeq (qp->snd_nxt);
+	seqTs.SetSeq (seq);
 	seqTs.SetPG (qp->m_pg);
 	p->AddHeader (seqTs);
 	// add udp header
@@ -817,15 +873,16 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	p->AddHeader (ppp);
 
 	// Account payload attempts independently from the original QP size so
-	// go-back-N work is visible at both success and failure terminal states.
-	if (qp->snd_nxt < qp->m_highest_sent)
+	// recovery work is visible at both success and failure terminal states.
+	if (is_repair || seq < qp->m_highest_sent)
 		qp->m_retransmitted_bytes += payload_size;
 	else
-		qp->m_highest_sent = qp->snd_nxt + payload_size;
+		qp->m_highest_sent = seq + payload_size;
 	qp->m_data_attempted_bytes += payload_size;
 
-	// update state
-	qp->snd_nxt += payload_size;
+	// update state; a repair never advances the new-data cursor
+	if (!is_repair)
+		qp->snd_nxt += payload_size;
 	qp->m_ipid++;
 
 	// return

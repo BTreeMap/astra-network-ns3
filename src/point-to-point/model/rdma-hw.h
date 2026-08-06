@@ -42,6 +42,7 @@ public:
 	bool m_backto0;
 	uint64_t m_retransmission_timeout_ns;
 	uint32_t m_max_retransmission_retries;
+	bool m_selective_retransmission;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 

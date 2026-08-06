@@ -144,7 +144,79 @@ void RdmaQueuePair::SetAppSentCallback(Callback<void> notifyAppSent){
 
 
 uint64_t RdmaQueuePair::GetBytesLeft(){
-	return m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	// Pending selective repairs count as sendable bytes: a queue pair whose
+	// tail is fully transmitted must stay schedulable until its repair
+	// ranges have been resent.
+	uint64_t tail = m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	return tail + RepairBytesLeft();
+}
+
+void RdmaQueuePair::AddRepairRange(uint64_t start, uint64_t end){
+	if (start < snd_una)
+		start = snd_una;
+	if (end > m_size)
+		end = m_size;
+	if (start >= end)
+		return;
+	// Merge with any overlapping or adjacent recorded ranges.
+	auto it = m_repair_ranges.lower_bound(start);
+	if (it != m_repair_ranges.begin()){
+		auto prev = std::prev(it);
+		if (prev->second >= start){
+			start = prev->first;
+			if (prev->second > end)
+				end = prev->second;
+			m_repair_ranges.erase(prev);
+		}
+	}
+	it = m_repair_ranges.lower_bound(start);
+	while (it != m_repair_ranges.end() && it->first <= end){
+		if (it->second > end)
+			end = it->second;
+		it = m_repair_ranges.erase(it);
+	}
+	m_repair_ranges[start] = end;
+}
+
+uint64_t RdmaQueuePair::TakeRepairSegment(uint64_t max_bytes, uint64_t &start){
+	DropAcknowledgedRepairs();
+	if (m_repair_ranges.empty() || max_bytes == 0)
+		return 0;
+	auto it = m_repair_ranges.begin();
+	start = it->first;
+	uint64_t size = it->second - it->first;
+	if (size > max_bytes)
+		size = max_bytes;
+	uint64_t new_start = start + size;
+	uint64_t end = it->second;
+	m_repair_ranges.erase(it);
+	if (new_start < end)
+		m_repair_ranges[new_start] = end;
+	return size;
+}
+
+void RdmaQueuePair::DropAcknowledgedRepairs(){
+	while (!m_repair_ranges.empty()){
+		auto it = m_repair_ranges.begin();
+		if (it->second <= snd_una){
+			m_repair_ranges.erase(it);
+			continue;
+		}
+		if (it->first < snd_una){
+			uint64_t end = it->second;
+			m_repair_ranges.erase(it);
+			m_repair_ranges[snd_una] = end;
+		}
+		break;
+	}
+}
+
+uint64_t RdmaQueuePair::RepairBytesLeft(){
+	DropAcknowledgedRepairs();
+	uint64_t total = 0;
+	for (auto const &range : m_repair_ranges)
+		total += range.second - range.first;
+	return total;
 }
 
 uint32_t RdmaQueuePair::GetHash(void){
@@ -246,6 +318,38 @@ uint32_t RdmaRxQueuePair::GetHash(void){
 	buf.sport = sport;
 	buf.dport = dport;
 	return Hash32(buf.c, 12);
+}
+
+void RdmaRxQueuePair::AddOutOfOrderRange(uint64_t start, uint64_t end){
+	if (start >= end)
+		return;
+	auto it = m_ooo_ranges.lower_bound(start);
+	if (it != m_ooo_ranges.begin()){
+		auto prev = std::prev(it);
+		if (prev->second >= start){
+			start = prev->first;
+			if (prev->second > end)
+				end = prev->second;
+			m_ooo_ranges.erase(prev);
+		}
+	}
+	it = m_ooo_ranges.lower_bound(start);
+	while (it != m_ooo_ranges.end() && it->first <= end){
+		if (it->second > end)
+			end = it->second;
+		it = m_ooo_ranges.erase(it);
+	}
+	m_ooo_ranges[start] = end;
+}
+
+uint64_t RdmaRxQueuePair::AbsorbContiguousFrom(uint64_t expected){
+	auto it = m_ooo_ranges.begin();
+	while (it != m_ooo_ranges.end() && it->first <= expected){
+		if (it->second > expected)
+			expected = it->second;
+		it = m_ooo_ranges.erase(it);
+	}
+	return expected;
 }
 
 /*********************

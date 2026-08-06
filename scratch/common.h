@@ -71,6 +71,7 @@ int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
+uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
 // TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
@@ -682,6 +683,8 @@ bool ReadConf(string network_configuration) {
       conf >> retransmission_timeout_ns;
     } else if (key.compare("MAX_RETRANSMISSION_RETRIES") == 0) {
       conf >> max_retransmission_retries;
+    } else if (key.compare("SELECTIVE_RETRANSMISSION") == 0) {
+      conf >> selective_retransmission;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
 	  conf >> packet_trim_mode;
 	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
@@ -832,6 +835,12 @@ bool ReadConf(string network_configuration) {
           static_cast<uint32_t>(PacketTrimMode::Disabled) &&
       (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
     std::cerr << "packet trimming requires retransmission timeout and retry budget\n";
+    return false;
+  }
+  if (selective_retransmission != 0 &&
+      (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
+    std::cerr << "SELECTIVE_RETRANSMISSION requires retransmission timeout and "
+                 "retry budget as its silent-loss fallback\n";
     return false;
   }
   // UEC 1.0.3 section 4.1.4.1: switches MUST place trimmed packets in a traffic
@@ -1178,6 +1187,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                UintegerValue(retransmission_timeout_ns));
       rdmaHw->SetAttribute("MaxRetransmissionRetries",
                UintegerValue(max_retransmission_retries));
+      rdmaHw->SetAttribute("SelectiveRetransmission",
+               BooleanValue(selective_retransmission != 0));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
