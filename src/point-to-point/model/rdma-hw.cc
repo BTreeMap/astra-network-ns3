@@ -685,9 +685,13 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 		}
 		q->ReceiverNextExpectedSeq = static_cast<uint32_t>(advanced);
 		if (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx)){
-			// The absorbed jump can cross several milestones at once.
-			while (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx))
-				q->m_milestone_rx += m_ack_interval;
+			// Single step, as the original transport did. A lagging milestone
+			// only means the next packets also generate cumulative ACKs, which
+			// is harmless; catching it up in a loop costs one iteration per
+			// ack-interval byte on EVERY in-order packet (payload/interval
+			// iterations at L2_ACK_INTERVAL 1), a hot-path tax with no
+			// behavioral benefit.
+			q->m_milestone_rx += m_ack_interval;
 			return 1; //Generate ACK
 		}else if (q->ReceiverNextExpectedSeq % m_chunk == 0){
 			return 1;

@@ -147,8 +147,14 @@ void RdmaQueuePair::SetAppSentCallback(Callback<void> notifyAppSent){
 uint64_t RdmaQueuePair::GetBytesLeft(){
 	// Pending selective repairs count as sendable bytes: a queue pair whose
 	// tail is fully transmitted must stay schedulable until its repair
-	// ranges have been resent.
+	// ranges have been resent. This runs inside the egress queue's per-packet
+	// scan over every registered queue pair, so the overwhelmingly common
+	// no-repairs case must stay one comparison — RepairBytesLeft() walks and
+	// prunes the range map and is only entered when ranges exist, which
+	// requires selective retransmission to be enabled and active.
 	uint64_t tail = m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	if (m_repair_ranges.empty())
+		return tail;
 	return tail + RepairBytesLeft();
 }
 
