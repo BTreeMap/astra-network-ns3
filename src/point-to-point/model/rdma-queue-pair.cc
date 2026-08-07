@@ -44,6 +44,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_trim_recovery_events = 0;
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;
+	m_last_progress_ns = Simulator::Now().GetNanoSeconds();
 	m_failure_reason = 0;
 	m_failed = false;
 	m_pg = pg;

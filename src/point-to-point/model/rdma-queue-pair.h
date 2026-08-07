@@ -33,6 +33,9 @@ public:
 	uint32_t m_trim_recovery_events;
 	uint32_t m_stale_trim_notifications;
 	uint32_t m_recovery_retries;
+	// Simulated time of the last cumulative-acknowledgement advance (or of
+	// queue-pair creation). The forward-progress deadline measures from here.
+	uint64_t m_last_progress_ns;
 	uint32_t m_failure_reason;
 	bool m_failed;
 	// Selective repair: merged byte ranges awaiting retransmission, always

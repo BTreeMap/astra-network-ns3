@@ -71,6 +71,7 @@ int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
+uint64_t no_progress_timeout_ns = 0;
 uint32_t selective_retransmission = 0;
 std::string packet_trim_mode = "disabled";
 // UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
@@ -683,6 +684,8 @@ bool ReadConf(string network_configuration) {
       conf >> retransmission_timeout_ns;
     } else if (key.compare("MAX_RETRANSMISSION_RETRIES") == 0) {
       conf >> max_retransmission_retries;
+    } else if (key.compare("NO_PROGRESS_TIMEOUT_NS") == 0) {
+      conf >> no_progress_timeout_ns;
     } else if (key.compare("SELECTIVE_RETRANSMISSION") == 0) {
       conf >> selective_retransmission;
 	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
@@ -835,6 +838,17 @@ bool ReadConf(string network_configuration) {
           static_cast<uint32_t>(PacketTrimMode::Disabled) &&
       (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
     std::cerr << "packet trimming requires retransmission timeout and retry budget\n";
+    return false;
+  }
+  // Trim notifications and NACKs are exempt from the retry budget, so the
+  // budget alone cannot bound a recovery loop that never advances snd_una.
+  // The forward-progress deadline is the liveness bound for that loop class
+  // and is therefore mandatory whenever trimming can generate such signals.
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      no_progress_timeout_ns == 0) {
+    std::cerr << "packet trimming requires NO_PROGRESS_TIMEOUT_NS as the "
+                 "liveness bound for budget-exempt recovery signals\n";
     return false;
   }
   if (selective_retransmission != 0 &&
@@ -1187,6 +1201,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                UintegerValue(retransmission_timeout_ns));
       rdmaHw->SetAttribute("MaxRetransmissionRetries",
                UintegerValue(max_retransmission_retries));
+      rdmaHw->SetAttribute("NoProgressTimeoutNs",
+               UintegerValue(no_progress_timeout_ns));
       rdmaHw->SetAttribute("SelectiveRetransmission",
                BooleanValue(selective_retransmission != 0));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));

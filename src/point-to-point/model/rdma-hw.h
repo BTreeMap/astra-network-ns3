@@ -14,6 +14,11 @@ namespace ns3 {
 enum class RdmaFailureReason : uint32_t {
 	TimeoutRetryExhausted = 1,
 	TrimRetryExhausted,
+	// Cumulative acknowledgement made no progress within the configured
+	// deadline even though recovery signals kept arriving. This is the
+	// bound the retry budget cannot provide once NACKs and trim
+	// notifications are (correctly) exempt from it.
+	NoForwardProgress,
 };
 
 struct RdmaInterfaceMgr{
@@ -42,6 +47,7 @@ public:
 	bool m_backto0;
 	uint64_t m_retransmission_timeout_ns;
 	uint32_t m_max_retransmission_retries;
+	uint64_t m_no_progress_timeout_ns;
 	bool m_selective_retransmission;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
@@ -96,6 +102,7 @@ public:
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
 	void HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
+	bool EnforceProgressDeadline(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 
 	// call this function after the NIC is setup

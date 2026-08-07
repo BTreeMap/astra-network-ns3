@@ -64,6 +64,16 @@ TypeId RdmaHw::GetTypeId (void)
 				UintegerValue(0),
 				MakeUintegerAccessor(&RdmaHw::m_max_retransmission_retries),
 				MakeUintegerChecker<uint32_t>())
+		.AddAttribute("NoProgressTimeoutNs",
+				"Zero disables the deadline; otherwise fail a queue pair whose "
+				"cumulative acknowledgement has not advanced for this simulated "
+				"interval. Recovery signals such as NACKs and trim notifications "
+				"prove the path is alive and are exempt from the retry budget, "
+				"but they are not evidence the transfer is progressing; this "
+				"deadline bounds the transfer itself.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_no_progress_timeout_ns),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("SelectiveRetransmission",
 				"Retransmit exactly the reported trimmed or missing byte ranges "
 				"and accept out-of-order payload at the receiver, instead of "
@@ -474,8 +484,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
-		if (qp->snd_una > acknowledged_before)
+		if (qp->snd_una > acknowledged_before){
 			qp->m_recovery_retries = 0;
+			qp->m_last_progress_ns = Simulator::Now().GetNanoSeconds();
+		}
 		if (qp->IsFinished()){
 			Simulator::Cancel(qp->m_retransmissionTimer);
 			QpComplete(qp);
@@ -483,6 +495,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		}
 	}
 	if (ch.l3Prot == 0xFD){ // NACK
+		if (EnforceProgressDeadline(qp)){
+			return 0;
+		}
 		if (m_selective_retransmission){
 			// The NACK names the gap head (its cumulative sequence) but not
 			// the gap's extent, so repair one packet at the head; successive
@@ -585,6 +600,9 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
 		qp->m_stale_trim_notifications++;
+		return;
+	}
+	if (EnforceProgressDeadline(qp)){
 		return;
 	}
 	// A trim notification never consumes the retry budget. Like a NACK, it
@@ -717,6 +735,39 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
 	qp->snd_nxt = qp->snd_una;
 }
 
+// Recovery signals prove the path is alive, so NACKs and trim notifications
+// are exempt from the silent-loss retry budget — but signal liveness is not
+// transfer liveness. A queue pair can cycle recovery signals forever without
+// ever advancing snd_una (the flagship livelock: one QP, an otherwise idle
+// fabric, simulated time racing to hours with zero progress). This deadline
+// bounds the one thing every healthy recovery mode eventually produces:
+// cumulative acknowledgement progress. It fails the queue pair with its
+// counters on record so the sustaining condition is attributable, instead of
+// letting the run burn wall clock until an external timeout kills it blind.
+bool RdmaHw::EnforceProgressDeadline(Ptr<RdmaQueuePair> qp){
+	if (m_no_progress_timeout_ns == 0 || qp->IsFinished() || qp->IsFailed()){
+		return false;
+	}
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	if (now - qp->m_last_progress_ns < m_no_progress_timeout_ns){
+		return false;
+	}
+	std::cerr << "No forward progress for " << (now - qp->m_last_progress_ns)
+		<< " ns on QP " << qp->m_src << "->" << qp->m_dest
+		<< " sport=" << qp->sport
+		<< " snd_una=" << qp->snd_una
+		<< " snd_nxt=" << qp->snd_nxt
+		<< " size=" << qp->m_size
+		<< " recovery_events=" << qp->m_recovery_events
+		<< " recovery_retries=" << qp->m_recovery_retries
+		<< " trim_notifications=" << qp->m_trim_notifications
+		<< " stale_trim_notifications=" << qp->m_stale_trim_notifications
+		<< " retransmitted_bytes=" << qp->m_retransmitted_bytes
+		<< " rate=" << qp->m_rate.GetBitRate() << "bps\n";
+	QpFail(qp, static_cast<uint32_t>(RdmaFailureReason::NoForwardProgress));
+	return true;
+}
+
 void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	if (m_retransmission_timeout_ns == 0 || qp->IsFinished() || qp->IsFailed())
 		return;
@@ -737,6 +788,9 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	const Ptr<RdmaQueuePair> active = GetQp(qp->dip.Get(), qp->sport, qp->m_pg);
 	if (active != qp)
 		return;
+	if (EnforceProgressDeadline(qp)){
+		return;
+	}
 	if (qp->m_recovery_retries >= m_max_retransmission_retries){
 		QpFail(qp, static_cast<uint32_t>(RdmaFailureReason::TimeoutRetryExhausted));
 		return;
