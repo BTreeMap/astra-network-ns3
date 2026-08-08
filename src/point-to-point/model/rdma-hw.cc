@@ -273,6 +273,9 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_nic[nic_idx].qpGrp->AddQp(qp);
 	uint64_t key = GetQpKey(dip.Get(), sport, pg);
 	m_qpMap[key] = qp;
+	// The liveness invariant starts at birth: an unfinished QP always has a
+	// pending timer, even if its first send never gets scheduled.
+	ArmRetransmissionTimeout(qp);
 
 	// set init variables
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
@@ -772,13 +775,20 @@ bool RdmaHw::EnforceProgressDeadline(Ptr<RdmaQueuePair> qp){
 	return true;
 }
 
+// An unfinished queue pair must ALWAYS carry a live timer. The previous
+// version cancelled the timer and re-armed nothing once snd_nxt equaled
+// snd_una — go-back-N recovery's exact post-state — so a queue pair whose
+// resend never happened (window-bound, rate-limited, device busy) was left
+// with no pending event of any kind: no RTO, no deadline check, nothing.
+// The CI wedge signature was a lone active QP and events_delta collapsing
+// to the qlen monitor alone while simulated time raced for hours. A
+// deadline enforced only from the victim's own events cannot fire on a
+// victim with no events; the always-armed timer is what carries it.
 void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	if (m_retransmission_timeout_ns == 0 || qp->IsFinished() || qp->IsFailed())
 		return;
 	if (!qp->m_retransmissionTimer.IsExpired())
 		Simulator::Cancel(qp->m_retransmissionTimer);
-	if (qp->snd_una >= qp->snd_nxt)
-		return;
 	qp->m_retransmissionTimer = Simulator::Schedule(
 		NanoSeconds(m_retransmission_timeout_ns),
 		&RdmaHw::HandleRetransmissionTimeout, this, qp);
@@ -787,12 +797,21 @@ void RdmaHw::ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	if (qp->IsFinished() || qp->IsFailed())
 		return;
-	if (qp->snd_una >= qp->snd_nxt)
-		return;
 	const Ptr<RdmaQueuePair> active = GetQp(qp->dip.Get(), qp->sport, qp->m_pg);
 	if (active != qp)
 		return;
 	if (EnforceProgressDeadline(qp)){
+		return;
+	}
+	if (qp->snd_una >= qp->snd_nxt){
+		// Nothing outstanding: the QP is waiting to (re)send — rate limiter,
+		// window, or a busy device. Not a silent-loss retry, so the budget
+		// is untouched; keep the timer alive so the deadline above stays
+		// enforceable and nudge the NIC in case its next-send event was
+		// never scheduled.
+		const uint32_t nic_idx = GetNicIdxOfQp(qp);
+		m_nic[nic_idx].dev->TriggerTransmit();
+		ArmRetransmissionTimeout(qp);
 		return;
 	}
 	if (qp->m_recovery_retries >= m_max_retransmission_retries){
