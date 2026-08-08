@@ -244,6 +244,13 @@ uint32_t RdmaQueuePair::GetHash(void){
 void RdmaQueuePair::Acknowledge(uint64_t ack){
 	if (ack > snd_una){
 		snd_una = ack;
+		// A cumulative ACK can outrun a go-back-N rewind: resent duplicates
+		// make the receiver repeat its frontier ACK, which lands above the
+		// rewound snd_nxt. Unclamped, GetOnTheFly() underflows and the window
+		// check blocks the queue pair from ever sending again.
+		if (snd_nxt < snd_una){
+			snd_nxt = snd_una;
+		}
 	}
 }
 
