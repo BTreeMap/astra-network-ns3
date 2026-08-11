@@ -28,6 +28,7 @@
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
 #include "ns3/qbb-header.h"
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <cmath>
@@ -181,6 +182,32 @@ void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type,
           dev->GetIfIndex(), queue, type);
 }
 
+// The analyzer reduces this telemetry to per-(event, plane) counts and byte
+// totals, so the simulator aggregates in memory and writes the summary rows
+// at exit. Raw per-packet rows, flushed on every event, grew past 100 GB per
+// arm on long runs - the write load, not the simulation itself, is what
+// exhausted shared storage and killed whole fleets of CI runners.
+FILE *transport_event_file = nullptr;
+map<pair<string, string>, pair<uint64_t, uint64_t>> transport_event_totals;
+
+void accumulate_transport_event(const string &event, const char *plane,
+                                uint64_t bytes) {
+  auto &totals = transport_event_totals[{event, plane}];
+  totals.first += 1;
+  totals.second += bytes;
+}
+
+void write_transport_event_summary() {
+  if (transport_event_file == nullptr)
+    return;
+  for (const auto &entry : transport_event_totals)
+    fprintf(transport_event_file, "%s,%s,%lu,%lu\n",
+            entry.first.first.c_str(), entry.first.second.c_str(),
+            static_cast<unsigned long>(entry.second.first),
+            static_cast<unsigned long>(entry.second.second));
+  fflush(transport_event_file);
+}
+
 void write_transport_event(FILE *fout, const char *event,
                            Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
                            uint32_t protocol, int32_t queue) {
@@ -188,33 +215,12 @@ void write_transport_event(FILE *fout, const char *event,
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  uint16_t source_port = 0;
-  uint32_t sequence = 0;
-  if (protocol == 0x11)
-    source_port = ch.udp.sport;
-  else if (protocol == 0xFC || protocol == 0xFD ||
-           protocol == kUecTrimRepairProtocol ||
-           protocol == kUecTrimNotificationProtocol)
-    source_port = ch.ack.sport;
-  if (protocol == 0x11)
-    sequence = ch.udp.seq;
-  else if (protocol == 0xFC || protocol == 0xFD ||
-           protocol == kUecTrimRepairProtocol ||
-           protocol == kUecTrimNotificationProtocol)
-    sequence = ch.ack.seq;
-  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
-  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
   // A trimmed packet rides the UDP protocol number but carries no payload, so
   // it is reported on the control plane alongside ACKs and NACKs.
   const bool payload_bearing =
       protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
-    fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
-          Simulator::Now().GetNanoSeconds(), event,
-          payload_bearing ? "data" : "control", protocol,
-          dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
-          dev->GetIfIndex(), source_host, destination_host, source_port,
-      sequence, packet->GetSize(), queue);
-  fflush(fout);
+  accumulate_transport_event(event, payload_bearing ? "data" : "control",
+                             packet->GetSize());
 }
 
 void get_transport_event(FILE *fout, const char *event,
@@ -239,14 +245,8 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
-  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
   const bool trimmed = IsUetTrimmedDscp(ch.GetIpv4Dscp());
   const bool udp = ch.l3Prot == 0x11;
-  const uint16_t source_port =
-      udp ? ch.udp.sport
-          : (trimmed ? ch.ack.sport : 0);
-  const uint32_t sequence = udp ? ch.udp.seq : (trimmed ? ch.ack.seq : 0);
   const char *event = "switch_unknown_drop";
   switch (static_cast<SwitchDropReason>(reason)) {
   case SwitchDropReason::Route:
@@ -264,12 +264,8 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
     event = "switch_trimmed_queue_drop";
     break;
   }
-    fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
-          Simulator::Now().GetNanoSeconds(), event,
-          (udp || trimmed) ? "data" : "control", ch.l3Prot,
-          sw->GetId(), sw->GetNodeType(), source_host, destination_host,
-      source_port, sequence, packet->GetSize());
-  fflush(fout);
+  accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
+                             packet->GetSize());
 }
 
 void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
@@ -281,13 +277,6 @@ void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
   // A UEC-conformant trim keeps the original UDP packet, truncated and remarked
   // DSCP_TRIMMED; the non-UET back-to-sender mode emits its own notification.
   const bool forwardToDestination = ch.l3Prot == 0x11;
-  const uint32_t source_host = ip_to_node_id(Ipv4Address(
-      forwardToDestination ? ch.sip : ch.dip));
-  const uint32_t destination_host = ip_to_node_id(Ipv4Address(
-      forwardToDestination ? ch.dip : ch.sip));
-  const uint16_t source_port =
-      forwardToDestination ? ch.udp.sport : ch.ack.dport;
-  const uint32_t sequence = forwardToDestination ? ch.udp.seq : ch.ack.seq;
   // The UDP length field is not modified by trimming, so it still reports the
   // payload that the trim replaced.
   const uint32_t trimmed_payload =
@@ -312,11 +301,8 @@ void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
     reason = "lasthop_egress_queue";
     break;
   }
-    fprintf(fout, "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
-          Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot,
-          sw->GetId(), sw->GetNodeType(), source_host, destination_host,
-      source_port, sequence, trimmed_payload);
-  fflush(fout);
+  accumulate_transport_event(string("trim_") + mode + "_" + reason, "data",
+                             trimmed_payload);
 }
 
 uint32_t data_loss_scope_value() {
@@ -1016,14 +1002,15 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   NS_LOG_INFO("Create channels.");
 
   FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
-  FILE *transport_event_file = fopen(transport_event_output_file.c_str(), "w");
+  transport_event_file = fopen(transport_event_output_file.c_str(), "w");
   if (pfc_file == nullptr || transport_event_file == nullptr) {
     std::cerr << "Error: cannot open PFC or transport event output file\n";
     return false;
   }
-  fprintf(transport_event_file,
-          "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
-      "destination_host,source_port,sequence,packet_bytes,queue\n");
+  fprintf(transport_event_file, "event,plane,event_count,total_bytes\n");
+  fflush(transport_event_file);
+  // The totals must land even when a watchdog exits the run mid-simulation.
+  std::atexit(write_transport_event_summary);
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
