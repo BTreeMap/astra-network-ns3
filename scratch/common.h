@@ -287,9 +287,9 @@ void accumulate_transport_event(const string &event, const char *plane,
   maybe_flush_transport_event_outputs();
 }
 
-void write_transport_event(FILE *fout, const char *event,
-                           Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
-                           uint32_t protocol, int32_t queue) {
+void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
+                           Ptr<const Packet> packet, uint32_t protocol,
+                           int32_t queue) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
@@ -325,23 +325,22 @@ void write_transport_event(FILE *fout, const char *event,
   append_transport_event_raw(row, length);
 }
 
-void get_transport_event(FILE *fout, const char *event,
-                         Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
-                         uint32_t protocol) {
-  write_transport_event(fout, event, dev, packet, protocol, -1);
+void get_transport_event(const char *event, Ptr<QbbNetDevice> dev,
+                         Ptr<const Packet> packet, uint32_t protocol) {
+  write_transport_event(event, dev, packet, protocol, -1);
 }
 
-void get_queue_event(FILE *fout, const char *event, Ptr<QbbNetDevice> dev,
+void get_queue_event(const char *event, Ptr<QbbNetDevice> dev,
                      Ptr<const Packet> packet, uint32_t queue) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  write_transport_event(fout, event, dev, packet, ch.l3Prot,
+  write_transport_event(event, dev, packet, ch.l3Prot,
                         static_cast<int32_t>(queue));
 }
 
-void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
+void get_switch_drop(Ptr<SwitchNode> sw,
                      Ptr<const Packet> packet, uint32_t reason) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
@@ -384,7 +383,7 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   append_transport_event_raw(row, length);
 }
 
-void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
+void get_switch_trim(Ptr<SwitchNode> sw,
                      Ptr<const Packet> packet, uint32_t trigger) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
@@ -474,28 +473,28 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
   dev->SetAttribute("DataLossErrorModel", PointerValue(model));
 }
 
-void connect_transport_traces(FILE *fout, Ptr<QbbNetDevice> dev) {
+void connect_transport_traces(Ptr<QbbNetDevice> dev) {
   if (data_loss_duration_ns != 0 ||
       packet_trim_mode_value() !=
           static_cast<uint32_t>(PacketTrimMode::Disabled)) {
     dev->TraceConnectWithoutContext(
-        "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+        "DataPlaneAttempt", MakeBoundCallback(&get_transport_event,
                                                 "data_arrival", dev));
     dev->TraceConnectWithoutContext(
-        "DataPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+        "DataPlaneDeliver", MakeBoundCallback(&get_transport_event,
                                                 "data_deliver", dev));
     dev->TraceConnectWithoutContext(
-        "DataPlaneLoss", MakeBoundCallback(&get_transport_event, fout,
+        "DataPlaneLoss", MakeBoundCallback(&get_transport_event,
                                              "data_injected_drop", dev));
     dev->TraceConnectWithoutContext(
-        "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
+        "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event,
                                                    "control_arrival", dev));
     dev->TraceConnectWithoutContext(
-        "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
+        "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event,
                                                    "control_deliver", dev));
   }
   dev->TraceConnectWithoutContext(
-      "QbbDrop", MakeBoundCallback(&get_queue_event, fout, "qbb_drop", dev));
+      "QbbDrop", MakeBoundCallback(&get_queue_event, "qbb_drop", dev));
 }
 
 struct QlenDistribution {
@@ -1174,11 +1173,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                        BooleanValue(packet_trim_lasthop != 0));
       sw->SetAttribute("PfcEnabled", BooleanValue(enable_pfc != 0));
       sw->TraceConnectWithoutContext(
-          "SwitchDrop", MakeBoundCallback(&get_switch_drop,
-                                            transport_event_file, sw));
+          "SwitchDrop", MakeBoundCallback(&get_switch_drop, sw));
         sw->TraceConnectWithoutContext(
-          "PacketTrim", MakeBoundCallback(&get_switch_trim,
-                          transport_event_file, sw));
+          "PacketTrim", MakeBoundCallback(&get_switch_trim, sw));
     }
   }
 
@@ -1209,8 +1206,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Ptr<QbbNetDevice> dst_dev = DynamicCast<QbbNetDevice>(d.Get(1));
     configure_data_loss(src_dev, static_cast<uint64_t>(i) * 2);
     configure_data_loss(dst_dev, static_cast<uint64_t>(i) * 2 + 1);
-    connect_transport_traces(transport_event_file, src_dev);
-    connect_transport_traces(transport_event_file, dst_dev);
+    connect_transport_traces(src_dev);
+    connect_transport_traces(dst_dev);
     if (snode->GetNodeType() == 0) {
       Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
       ipv4->AddInterface(d.Get(0));
