@@ -33,6 +33,7 @@
 #include <iostream>
 #include <cmath>
 #include <limits>
+#include <zstd.h>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -54,7 +55,12 @@ double pause_time = 5, simulator_stop_time = 3.01;
 std::string topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
-std::string transport_event_output_file = "transport_events.csv";
+// The raw per-packet log always exists - keeping the research artifact
+// invariant - and keeps its historic ns-3 CSV syntax; only the container is
+// zstd-compressed.
+std::string transport_event_output_file = "transport_events.csv.zst";
+// Aggregated per-(event, plane) totals; what the analyzer consumes.
+std::string transport_event_summary_output_file = "transport_summary.csv";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -182,30 +188,103 @@ void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type,
           dev->GetIfIndex(), queue, type);
 }
 
-// The analyzer reduces this telemetry to per-(event, plane) counts and byte
-// totals, so the simulator aggregates in memory and writes the summary rows
-// at exit. Raw per-packet rows, flushed on every event, grew past 100 GB per
-// arm on long runs - the write load, not the simulation itself, is what
-// exhausted shared storage and killed whole fleets of CI runners.
-FILE *transport_event_file = nullptr;
+// The analyzer reduces transport telemetry to per-(event, plane) counts and
+// byte totals, so the simulator aggregates in memory and periodically
+// rewrites a small summary file. The raw per-packet log survives as a
+// research artifact in its historic ns-3 CSV syntax, but zstd-compressed on
+// a library worker thread (the second CI core): uncompressed and flushed
+// per row it grew past 160 GB per arm, and the write load - not the
+// simulation - is what exhausted shared storage and killed whole runner
+// fleets. If compression ever falls behind, ZSTD_compressStream2 blocks the
+// producer rather than dropping rows.
+FILE *transport_event_summary_file = nullptr;
 map<pair<string, string>, pair<uint64_t, uint64_t>> transport_event_totals;
+FILE *transport_event_raw_file = nullptr;
+ZSTD_CCtx *transport_event_raw_cctx = nullptr;
+string transport_event_raw_pending;
+vector<char> transport_event_raw_scratch;
+time_t transport_event_last_flush = 0;
+
+void flush_transport_event_raw(ZSTD_EndDirective directive) {
+  ZSTD_inBuffer input = {transport_event_raw_pending.data(),
+                         transport_event_raw_pending.size(), 0};
+  bool draining = true;
+  while (draining) {
+    ZSTD_outBuffer output = {transport_event_raw_scratch.data(),
+                             transport_event_raw_scratch.size(), 0};
+    const size_t remaining =
+        ZSTD_compressStream2(transport_event_raw_cctx, &output, &input,
+                             directive);
+    if (ZSTD_isError(remaining)) {
+      std::cerr << "transport event raw stream: "
+                << ZSTD_getErrorName(remaining) << "\n";
+      break;
+    }
+    if (output.pos != 0)
+      fwrite(transport_event_raw_scratch.data(), 1, output.pos,
+             transport_event_raw_file);
+    // e_flush and e_end must drain the worker completely; e_continue only
+    // needs the pending input accepted.
+    draining = directive == ZSTD_e_continue ? input.pos < input.size
+                                            : remaining != 0;
+  }
+  transport_event_raw_pending.clear();
+}
+
+void append_transport_event_raw(const char *row, int length) {
+  if (length <= 0)
+    return;
+  transport_event_raw_pending.append(row, static_cast<size_t>(length));
+  if (transport_event_raw_pending.size() >= (1u << 22))
+    flush_transport_event_raw(ZSTD_e_continue);
+}
+
+void finalize_transport_event_raw() {
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  flush_transport_event_raw(ZSTD_e_end);
+  fclose(transport_event_raw_file);
+  ZSTD_freeCCtx(transport_event_raw_cctx);
+  transport_event_raw_cctx = nullptr;
+  transport_event_raw_file = nullptr;
+}
+
+// Rewritten in place on every flush, so the totals are observable while the
+// simulation runs and complete at exit.
+void write_transport_event_summary() {
+  if (transport_event_summary_file == nullptr)
+    return;
+  rewind(transport_event_summary_file);
+  fprintf(transport_event_summary_file, "event,plane,event_count,total_bytes\n");
+  for (const auto &entry : transport_event_totals)
+    fprintf(transport_event_summary_file, "%s,%s,%lu,%lu\n",
+            entry.first.first.c_str(), entry.first.second.c_str(),
+            static_cast<unsigned long>(entry.second.first),
+            static_cast<unsigned long>(entry.second.second));
+  fflush(transport_event_summary_file);
+}
+
+// Optimistic flush: with the per-row fflush gone, land both outputs about
+// once a minute so a hard kill loses at most the trailing window and the
+// artifacts stay inspectable mid-run.
+void maybe_flush_transport_event_outputs() {
+  const time_t now = time(nullptr);
+  if (now - transport_event_last_flush < 60)
+    return;
+  transport_event_last_flush = now;
+  write_transport_event_summary();
+  if (transport_event_raw_cctx != nullptr) {
+    flush_transport_event_raw(ZSTD_e_flush);
+    fflush(transport_event_raw_file);
+  }
+}
 
 void accumulate_transport_event(const string &event, const char *plane,
                                 uint64_t bytes) {
   auto &totals = transport_event_totals[{event, plane}];
   totals.first += 1;
   totals.second += bytes;
-}
-
-void write_transport_event_summary() {
-  if (transport_event_file == nullptr)
-    return;
-  for (const auto &entry : transport_event_totals)
-    fprintf(transport_event_file, "%s,%s,%lu,%lu\n",
-            entry.first.first.c_str(), entry.first.second.c_str(),
-            static_cast<unsigned long>(entry.second.first),
-            static_cast<unsigned long>(entry.second.second));
-  fflush(transport_event_file);
+  maybe_flush_transport_event_outputs();
 }
 
 void write_transport_event(FILE *fout, const char *event,
@@ -221,6 +300,29 @@ void write_transport_event(FILE *fout, const char *event,
       protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
   accumulate_transport_event(event, payload_bearing ? "data" : "control",
                              packet->GetSize());
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  uint16_t source_port = 0;
+  uint32_t sequence = 0;
+  if (protocol == 0x11) {
+    source_port = ch.udp.sport;
+    sequence = ch.udp.seq;
+  } else if (protocol == 0xFC || protocol == 0xFD ||
+             protocol == kUecTrimRepairProtocol ||
+             protocol == kUecTrimNotificationProtocol) {
+    source_port = ch.ack.sport;
+    sequence = ch.ack.seq;
+  }
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
+      Simulator::Now().GetNanoSeconds(), event,
+      payload_bearing ? "data" : "control", protocol,
+      dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
+      dev->GetIfIndex(), ip_to_node_id(Ipv4Address(ch.sip)),
+      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      packet->GetSize(), queue);
+  append_transport_event_raw(row, length);
 }
 
 void get_transport_event(FILE *fout, const char *event,
@@ -266,6 +368,20 @@ void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
   }
   accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
                              packet->GetSize());
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  const uint16_t source_port =
+      udp ? ch.udp.sport : (trimmed ? ch.ack.sport : 0);
+  const uint32_t sequence = udp ? ch.udp.seq : (trimmed ? ch.ack.seq : 0);
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
+      Simulator::Now().GetNanoSeconds(), event,
+      (udp || trimmed) ? "data" : "control", ch.l3Prot, sw->GetId(),
+      sw->GetNodeType(), ip_to_node_id(Ipv4Address(ch.sip)),
+      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      packet->GetSize());
+  append_transport_event_raw(row, length);
 }
 
 void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
@@ -303,6 +419,18 @@ void get_switch_trim(FILE *fout, Ptr<SwitchNode> sw,
   }
   accumulate_transport_event(string("trim_") + mode + "_" + reason, "data",
                              trimmed_payload);
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
+      Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot, sw->GetId(),
+      sw->GetNodeType(),
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip)),
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip)),
+      forwardToDestination ? ch.udp.sport : ch.ack.dport,
+      forwardToDestination ? ch.udp.seq : ch.ack.seq, trimmed_payload);
+  append_transport_event_raw(row, length);
 }
 
 uint32_t data_loss_scope_value() {
@@ -732,6 +860,8 @@ bool ReadConf(string network_configuration) {
       conf >> pfc_output_file;
     } else if (key.compare("TRANSPORT_EVENT_OUTPUT_FILE") == 0) {
       conf >> transport_event_output_file;
+    } else if (key.compare("TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE") == 0) {
+      conf >> transport_event_summary_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("ENABLE_TRACE") == 0) {
@@ -1002,15 +1132,36 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   NS_LOG_INFO("Create channels.");
 
   FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
-  transport_event_file = fopen(transport_event_output_file.c_str(), "w");
-  if (pfc_file == nullptr || transport_event_file == nullptr) {
-    std::cerr << "Error: cannot open PFC or transport event output file\n";
+  transport_event_summary_file =
+      fopen(transport_event_summary_output_file.c_str(), "w");
+  transport_event_raw_file = fopen(transport_event_output_file.c_str(), "wb");
+  transport_event_raw_cctx = ZSTD_createCCtx();
+  if (pfc_file == nullptr || transport_event_summary_file == nullptr ||
+      transport_event_raw_file == nullptr ||
+      transport_event_raw_cctx == nullptr) {
+    std::cerr << "Error: cannot open PFC or transport event output files\n";
     return false;
   }
-  fprintf(transport_event_file, "event,plane,event_count,total_bytes\n");
-  fflush(transport_event_file);
   // The totals must land even when a watchdog exits the run mid-simulation.
   std::atexit(write_transport_event_summary);
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
+  // Long-distance matching folds the workload's periodic collective
+  // patterns; window 2^27 stays within every decoder's no-flags default.
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx,
+                         ZSTD_c_enableLongDistanceMatching, 1);
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_windowLog, 27);
+  // One worker keeps compression off the simulation thread. On a
+  // single-threaded libzstd this parameter is refused and the stream
+  // simply compresses synchronously - correct either way.
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_nbWorkers, 1);
+  transport_event_raw_pending.reserve(1u << 22);
+  transport_event_raw_scratch.resize(ZSTD_CStreamOutSize());
+  transport_event_last_flush = time(nullptr);
+  static const char raw_header[] =
+      "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
+      "destination_host,source_port,sequence,packet_bytes,queue\n";
+  append_transport_event_raw(raw_header, sizeof(raw_header) - 1);
+  std::atexit(finalize_transport_event_raw);
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
