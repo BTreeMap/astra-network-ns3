@@ -204,6 +204,24 @@ ZSTD_CCtx *transport_event_raw_cctx = nullptr;
 string transport_event_raw_pending;
 vector<char> transport_event_raw_scratch;
 time_t transport_event_last_flush = 0;
+// The raw stream is a sequence of independently decompressible zstd frames
+// ("segments"), rotated when a segment's compressed size crosses the limit
+// below. Segments exist so a multi-gigabyte run can ship its raw log
+// incrementally and every shipped piece stays under the 2 GiB
+// release-asset cap; `cat <name>.zst.* | zstd -d` reconstructs the exact
+// historic single-file CSV (the header lives once, in segment .000, so a
+// surviving mid-run segment is still headerless rows in the same syntax).
+// Rotation only ever happens at a row boundary: rows enter the pending
+// buffer whole, and a frame ends only after that buffer fully drains.
+uint32_t transport_event_raw_segment_index = 0;
+uint64_t transport_event_raw_segment_bytes = 0;
+uint64_t transport_event_segment_byte_limit = 1800000000ull;
+
+std::string transport_event_segment_path(uint32_t index) {
+  char suffix[8];
+  snprintf(suffix, sizeof(suffix), ".%03u", index);
+  return transport_event_output_file + suffix;
+}
 
 void flush_transport_event_raw(ZSTD_EndDirective directive) {
   ZSTD_inBuffer input = {transport_event_raw_pending.data(),
@@ -220,9 +238,11 @@ void flush_transport_event_raw(ZSTD_EndDirective directive) {
                 << ZSTD_getErrorName(remaining) << "\n";
       break;
     }
-    if (output.pos != 0)
+    if (output.pos != 0) {
       fwrite(transport_event_raw_scratch.data(), 1, output.pos,
              transport_event_raw_file);
+      transport_event_raw_segment_bytes += output.pos;
+    }
     // e_flush and e_end must drain the worker completely; e_continue only
     // needs the pending input accepted.
     draining = directive == ZSTD_e_continue ? input.pos < input.size
@@ -231,12 +251,43 @@ void flush_transport_event_raw(ZSTD_EndDirective directive) {
   transport_event_raw_pending.clear();
 }
 
+void rotate_transport_event_raw_segment() {
+  // Seal the current segment as a complete zstd frame and start the next
+  // one on the same compression parameters. A sealed segment is immutable
+  // on disk from this instant - which is the entire coordination protocol
+  // with the mid-run uploader: the existence of segment N+1 is the proof
+  // that segment N may be shipped and deleted.
+  flush_transport_event_raw(ZSTD_e_end);
+  fclose(transport_event_raw_file);
+  transport_event_raw_segment_index++;
+  transport_event_raw_file = fopen(
+      transport_event_segment_path(transport_event_raw_segment_index).c_str(),
+      "wb");
+  if (transport_event_raw_file == nullptr) {
+    // Losing the raw stream must not kill a multi-day simulation: the
+    // summary file carries everything the analyzer needs regardless.
+    std::cerr << "transport event raw stream: cannot open segment "
+              << transport_event_raw_segment_index
+              << "; raw logging stops here\n";
+    ZSTD_freeCCtx(transport_event_raw_cctx);
+    transport_event_raw_cctx = nullptr;
+    return;
+  }
+  ZSTD_CCtx_reset(transport_event_raw_cctx, ZSTD_reset_session_only);
+  transport_event_raw_segment_bytes = 0;
+}
+
 void append_transport_event_raw(const char *row, int length) {
   if (length <= 0)
     return;
   transport_event_raw_pending.append(row, static_cast<size_t>(length));
   if (transport_event_raw_pending.size() >= (1u << 22))
     flush_transport_event_raw(ZSTD_e_continue);
+  // Checked after the write path, so a segment can overshoot the limit by
+  // at most one drained burst; the limit leaves ~350 MB of headroom under
+  // the 2 GiB cap for exactly that reason.
+  if (transport_event_raw_segment_bytes >= transport_event_segment_byte_limit)
+    rotate_transport_event_raw_segment();
 }
 
 void finalize_transport_event_raw() {
@@ -859,6 +910,8 @@ bool ReadConf(string network_configuration) {
       conf >> pfc_output_file;
     } else if (key.compare("TRANSPORT_EVENT_OUTPUT_FILE") == 0) {
       conf >> transport_event_output_file;
+    } else if (key.compare("TRANSPORT_EVENT_SEGMENT_BYTES") == 0) {
+      conf >> transport_event_segment_byte_limit;
     } else if (key.compare("TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE") == 0) {
       conf >> transport_event_summary_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
@@ -1133,7 +1186,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
   transport_event_summary_file =
       fopen(transport_event_summary_output_file.c_str(), "w");
-  transport_event_raw_file = fopen(transport_event_output_file.c_str(), "wb");
+  // Segment .000 always exists - the research invariant now holds at
+  // segment granularity, and the configured name is the family's base.
+  transport_event_raw_file =
+      fopen(transport_event_segment_path(0).c_str(), "wb");
   transport_event_raw_cctx = ZSTD_createCCtx();
   if (pfc_file == nullptr || transport_event_summary_file == nullptr ||
       transport_event_raw_file == nullptr ||
