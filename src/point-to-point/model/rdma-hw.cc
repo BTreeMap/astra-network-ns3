@@ -409,10 +409,10 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 }
 
 // The receiver's cumulative acknowledgement, shared by the in-order data path
-// and the forgiveness fork. A forgiven non-last-hop trim leaves a debt to
-// congestion control here: the next ACK carries FLAG_CNP so ReceiveAck runs
-// cnp_received_mlx exactly as a pulled trim would, and forgiving does not
-// hide congestion.
+// and the forgiveness fork. The forgive path passes cnp true: the ACK it
+// emits carries FLAG_CNP, so ReceiveAck runs cnp_received_mlx exactly as a
+// pulled trim would and forgiving does not hide congestion. The debt is paid
+// by the ACK the forgive emits, not carried on whichever ACK comes next.
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, bool nack, bool cnp){
@@ -422,10 +422,6 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	seqh.SetSport(sport);
 	seqh.SetDport(dport);
 	seqh.SetIntHeader(ih);
-	if (q->m_pending_cnp){
-		q->m_pending_cnp = false;
-		cnp = true;
-	}
 	if (cnp)
 		seqh.SetCnp();
 
@@ -507,6 +503,13 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
+	// The flag reports congestion on the path, not on the bytes this ACK
+	// covers, so it is taken before the acknowledgement that may complete the
+	// queue pair and return. A forgiven trim rides its own ACK, and that ACK is
+	// often the one that closes the transfer.
+	if (cnp && m_cc_mode == 1){ // mlx version
+		cnp_received_mlx(qp);
+	}
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
@@ -542,13 +545,6 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			qp->AddRepairRange(gap_start, gap_end);
 		}else{
 			RecoverQueue(qp);
-		}
-	}
-
-	// handle cnp
-	if (cnp){
-		if (m_cc_mode == 1){ // mlx version
-			cnp_received_mlx(qp);
 		}
 	}
 
@@ -753,10 +749,10 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		}
 		// UEC 1.0.3 p. 356 keeps a last-hop trim out of the congestion signal
 		// only where RCCC covers the last hop; this transport has none, so the
-		// debt is owed for every trim the sender would otherwise have seen.
-		q->m_pending_cnp = true;
+		// debt is owed for every trim the sender would otherwise have seen, and
+		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, false);
+			ch.udp.ih, false, true);
 		return;
 	}
 	const bool priority = verdict == VERDICT_PULL_PRIORITY;

@@ -323,7 +323,6 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
-	m_pending_cnp = false;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

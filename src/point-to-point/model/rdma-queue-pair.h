@@ -181,9 +181,6 @@ public:
 	// re-segmenter can chop a merged range at a boundary no trim used, so
 	// entries are not assumed packet-aligned with the trims that arrive.
 	std::map<uint64_t, PulledRange> m_pulled_ranges;
-	// A forgiven non-last-hop trim owes congestion control one CNP, carried on
-	// the next ACK. Without it a forgiven trim hides congestion.
-	bool m_pending_cnp;
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
