@@ -177,13 +177,10 @@ public:
 		// the same request, or one range could be pulled at two priorities.
 		bool priority;
 	};
-	// Trimmed ranges with a PULL outstanding, keyed by start. Trims name
-	// packet-aligned disjoint ranges, so the map never merges and its front
-	// is always the lowest range; pruning pops the front below
-	// ReceiverNextExpectedSeq on every advance.
+	// Trimmed ranges with a PULL outstanding, keyed by start. A repair
+	// re-segmenter can chop a merged range at a boundary no trim used, so
+	// entries are not assumed packet-aligned with the trims that arrive.
 	std::map<uint64_t, PulledRange> m_pulled_ranges;
-	uint64_t m_forgiven_bytes;
-	uint32_t m_forgiven_ranges;
 	// A forgiven non-last-hop trim owes congestion control one CNP, carried on
 	// the next ACK. Without it a forgiven trim hides congestion.
 	bool m_pending_cnp;
@@ -193,14 +190,17 @@ public:
 	uint32_t GetHash(void);
 	void AddOutOfOrderRange(uint64_t start, uint64_t end);
 	uint64_t AbsorbContiguousFrom(uint64_t expected);
-	// True when the receiver will never need these bytes again: either the
-	// cumulative sequence has passed them, or an accepted out-of-order range
-	// covers them, forgiveness included.
-	bool IsRangeSettled(uint64_t start, uint64_t end) const;
-	// The outstanding PULL for a range, or nullptr when none is outstanding.
-	const PulledRange* FindPulledRange(uint64_t start) const;
+	// Bytes of [start, end) the receiver has not accepted: neither below the
+	// cumulative sequence nor inside an accepted out-of-order range,
+	// forgiveness included. Exactly the count AddOutOfOrderRange would
+	// absorb, so a ledger charged this figure charges what it takes. Zero
+	// means the range is settled and the trim is a duplicate.
+	uint64_t UnsettledBytes(uint64_t start, uint64_t end) const;
+	// The outstanding PULL covering an offset, or nullptr when none is. The
+	// offset need not be the recorded start: a re-segmented repair can trim a
+	// range that begins inside one already pulled.
+	const PulledRange* FindPulledRange(uint64_t offset) const;
 	void RecordPulledRange(uint64_t start, uint64_t end, bool priority);
-	void ForgiveRange(uint64_t start, uint64_t end);
 	// Drop every pulled range the cumulative sequence has passed. Callers
 	// must check emptiness first: this runs on the receive path.
 	void PruneSettledPulls();

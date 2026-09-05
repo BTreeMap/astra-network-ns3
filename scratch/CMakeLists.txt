@@ -23,3 +23,14 @@ build_exec(
   LIBRARIES_TO_LINK "${astra-sim-ns3-libs-list}" "AstraSim" "${ZSTD_LIBRARY}"
   EXECUTABLE_DIRECTORY_PATH "${PROJECT_SOURCE_DIR}/build/scratch/"
 )
+
+# The receive-side range algebra the recovery domain charges from. Its
+# straddle and partial-overlap branches are unreachable through the switch,
+# because every packet and every repair segment starts at a packet boundary,
+# so they are asserted here instead of through a fabric fixture.
+build_exec(
+  EXECNAME RdmaRangeAlgebra
+  SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/rdma-range-algebra.cc
+  LIBRARIES_TO_LINK "${astra-sim-ns3-libs-list}"
+  EXECUTABLE_DIRECTORY_PATH "${PROJECT_SOURCE_DIR}/build/scratch/"
+)

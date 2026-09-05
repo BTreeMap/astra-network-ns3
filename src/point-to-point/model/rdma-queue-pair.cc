@@ -6,6 +6,7 @@
 #include <ns3/simulator.h>
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
+#include <algorithm>
 
 namespace ns3 {
 
@@ -322,8 +323,6 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
-	m_forgiven_bytes = 0;
-	m_forgiven_ranges = 0;
 	m_pending_cnp = false;
 }
 
@@ -374,24 +373,40 @@ uint64_t RdmaRxQueuePair::AbsorbContiguousFrom(uint64_t expected){
 	return expected;
 }
 
-bool RdmaRxQueuePair::IsRangeSettled(uint64_t start, uint64_t end) const{
-	if (end <= static_cast<uint64_t>(ReceiverNextExpectedSeq))
-		return true;
-	if (m_ooo_ranges.empty())
-		return false;
+uint64_t RdmaRxQueuePair::UnsettledBytes(uint64_t start, uint64_t end) const{
+	// Clip below: everything under the cumulative sequence is delivered, so a
+	// trim straddling it names fewer new bytes than its length.
+	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
+	if (start < expected)
+		start = expected;
+	if (start >= end)
+		return 0;
+	uint64_t unsettled = end - start;
+	// AddOutOfOrderRange merges every overlapping and touching range, so the
+	// entries are disjoint and no byte is subtracted twice. The scan starts at
+	// the last entry beginning at or below start, the only one that can reach
+	// into the range from the left.
 	auto it = m_ooo_ranges.upper_bound(start);
-	if (it == m_ooo_ranges.begin())
-		return false;
-	--it;
-	return it->second >= end;
+	if (it != m_ooo_ranges.begin())
+		--it;
+	for (; it != m_ooo_ranges.end() && it->first < end; ++it){
+		const uint64_t overlap_start = std::max(it->first, start);
+		const uint64_t overlap_end = std::min(it->second, end);
+		if (overlap_end > overlap_start)
+			unsettled -= overlap_end - overlap_start;
+	}
+	return unsettled;
 }
 
 const RdmaRxQueuePair::PulledRange* RdmaRxQueuePair::FindPulledRange(
-		uint64_t start) const{
+		uint64_t offset) const{
 	if (m_pulled_ranges.empty())
 		return nullptr;
-	auto it = m_pulled_ranges.find(start);
-	return it == m_pulled_ranges.end() ? nullptr : &it->second;
+	auto it = m_pulled_ranges.upper_bound(offset);
+	if (it == m_pulled_ranges.begin())
+		return nullptr;
+	--it;
+	return it->second.end > offset ? &it->second : nullptr;
 }
 
 void RdmaRxQueuePair::RecordPulledRange(uint64_t start, uint64_t end,
@@ -399,19 +414,19 @@ void RdmaRxQueuePair::RecordPulledRange(uint64_t start, uint64_t end,
 	m_pulled_ranges[start] = PulledRange{end, priority};
 }
 
-void RdmaRxQueuePair::ForgiveRange(uint64_t start, uint64_t end){
-	if (start >= end)
-		return;
-	AddOutOfOrderRange(start, end);
-	m_forgiven_bytes += end - start;
-	m_forgiven_ranges++;
-}
-
 void RdmaRxQueuePair::PruneSettledPulls(){
 	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
-	auto it = m_pulled_ranges.begin();
-	while (it != m_pulled_ranges.end() && it->second.end <= expected)
-		it = m_pulled_ranges.erase(it);
+	// An entry starting at or above the cumulative sequence ends above it, so
+	// the scan stops there. Below it every settled entry is erased, including
+	// one sitting behind an entry that still straddles the frontier; a
+	// front-only pop would leave those in place forever.
+	const auto limit = m_pulled_ranges.lower_bound(expected);
+	for (auto it = m_pulled_ranges.begin(); it != limit; ){
+		if (it->second.end <= expected)
+			it = m_pulled_ranges.erase(it);
+		else
+			++it;
+	}
 }
 
 /*********************

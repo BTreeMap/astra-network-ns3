@@ -694,16 +694,37 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 // PULLs at different priorities for one range is not a state the sender can
 // resolve; unknown asks the verdict callback once, and the answer is sticky
 // because forgiving is absorbing and pulling is recorded.
+//
+// The verdict is asked about the unsettled bytes, never the whole trimmed
+// range. A repair re-segmenter can trim a range that straddles the cumulative
+// sequence or overlaps a range already accepted, and charging its full length
+// would spend budget on bytes the receiver already holds.
 void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		bool lastHop){
+	// Never create: the flow that owned this receive queue pair may have
+	// completed, and resurrecting it would leave a stale cumulative sequence
+	// for whichever later flow reuses the source port. A trim with no receive
+	// state gets the plain PULL the non-forgiveness path would have sent.
 	Ptr<RdmaRxQueuePair> q = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport,
-		ch.udp.pg, true);
+		ch.udp.pg, false);
+	if (q == nullptr){
+		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.seq, payloadSize, lastHop, false);
+		return;
+	}
 	const uint64_t start = ch.udp.seq;
 	const uint64_t end = start + payloadSize;
-	if (q->IsRangeSettled(start, end)){
+	const uint64_t unsettled = q->UnsettledBytes(start, end);
+	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, false, false);
 		return;
+	}
+	if (unsettled < payloadSize){
+		// The clip fired: the range partly overlaps what the receiver holds.
+		// Counted so a fixture can prove it exercised the path rather than
+		// asserting an identity that holds vacuously.
+		ReportTransportEvent("clipped_trim", 0);
 	}
 	if (const RdmaRxQueuePair::PulledRange* pulled = q->FindPulledRange(start)){
 		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
@@ -713,15 +734,20 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	const uint8_t verdict = m_recoveryVerdictCallback.IsNull()
 		? static_cast<uint8_t>(VERDICT_PULL)
 		: m_recoveryVerdictCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
-			start, payloadSize);
+			start, static_cast<uint32_t>(unsettled));
 	if (verdict == VERDICT_FORGIVE){
-		q->ForgiveRange(start, end);
+		// Forgiving is absorbing: the range joins the accepted out-of-order
+		// set as though it had arrived, so the cumulative sequence can pass it
+		// and no repair is ever requested. It absorbs exactly the unsettled
+		// bytes, which is what the ledger was charged.
+		q->AddOutOfOrderRange(start, end);
 		// Beside the switch's trim_ftd_* events, so the reader can subtract:
 		// W' = (trimmed - forgiven) / offered.
-		ReportTransportEvent("trim_forgiven", payloadSize);
-		if (start == static_cast<uint64_t>(q->ReceiverNextExpectedSeq)){
+		ReportTransportEvent("trim_forgiven", static_cast<uint32_t>(unsettled));
+		const uint64_t expected = static_cast<uint64_t>(q->ReceiverNextExpectedSeq);
+		if (start <= expected){
 			q->ReceiverNextExpectedSeq =
-				static_cast<uint32_t>(q->AbsorbContiguousFrom(start));
+				static_cast<uint32_t>(q->AbsorbContiguousFrom(expected));
 			if (!q->m_pulled_ranges.empty())
 				q->PruneSettledPulls();
 		}
