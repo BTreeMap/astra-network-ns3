@@ -716,6 +716,9 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 			start, payloadSize);
 	if (verdict == VERDICT_FORGIVE){
 		q->ForgiveRange(start, end);
+		// Beside the switch's trim_ftd_* events, so the reader can subtract:
+		// W' = (trimmed - forgiven) / offered.
+		ReportTransportEvent("trim_forgiven", payloadSize);
 		if (start == static_cast<uint64_t>(q->ReceiverNextExpectedSeq)){
 			q->ReceiverNextExpectedSeq =
 				static_cast<uint32_t>(q->AbsorbContiguousFrom(start));
@@ -914,16 +917,16 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 	}
 	qp->m_recovery_retries++;
 	qp->m_timeouts++;
-	ReportTransportEvent("rto_fired");
+	ReportTransportEvent("rto_fired", 0);
 	RecoverQueue(qp);
 	const uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].dev->TriggerTransmit();
 	ArmRetransmissionTimeout(qp);
 }
 
-void RdmaHw::ReportTransportEvent(const char* event){
+void RdmaHw::ReportTransportEvent(const char* event, uint64_t bytes){
 	if (!m_transportEventCallback.IsNull())
-		m_transportEventCallback(event);
+		m_transportEventCallback(event, bytes);
 }
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
@@ -1123,7 +1126,7 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q){
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
 	q->m_cnp_received++;
-	ReportTransportEvent("cnp_taken");
+	ReportTransportEvent("cnp_taken", 0);
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update
 	q->mlx.m_decrease_cnp_arrived = true; // set CNP_arrived bit for rate decrease
 	if (q->mlx.m_first_cnp){

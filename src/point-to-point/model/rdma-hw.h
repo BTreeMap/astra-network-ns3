@@ -71,9 +71,9 @@ public:
 	// Host-transport events no packet trace can observe: a retransmission
 	// timeout firing and a DCQCN rate cut being taken. The scratch layer
 	// aggregates them into transport_summary.csv beside the wire events.
-	typedef Callback<void, const char*> TransportEventCallback;
+	typedef Callback<void, const char*, uint64_t> TransportEventCallback;
 	TransportEventCallback m_transportEventCallback;
-	void ReportTransportEvent(const char* event);
+	void ReportTransportEvent(const char* event, uint64_t bytes);
 
 	// What the receiver does with a trimmed range it has no decision for.
 	// The transport is semantics-blind: it never reads a training step, a

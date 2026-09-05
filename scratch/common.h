@@ -29,6 +29,7 @@
 #include "ns3/qbb-helper.h"
 #include "ns3/qbb-header.h"
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <cmath>
@@ -341,8 +342,14 @@ void accumulate_transport_event(const string &event, const char *plane,
 // A host-transport reaction carries no packet, so it contributes a count and
 // no bytes. It rides the control plane because that is what it answers to: a
 // retransmission timeout is the absence of an ACK, a rate cut is a CNP.
-void record_host_transport_event(const char *event) {
-  accumulate_transport_event(event, "control", 0);
+void record_host_transport_event(const char *event, uint64_t bytes) {
+  // A forgiven trim accounts for payload bytes that were never delivered, so
+  // it rides the data plane beside the switch's own trim events. The other
+  // reactions carry no packet and answer to the control plane: a
+  // retransmission timeout is a missing ACK, a rate cut is a CNP.
+  const char *plane =
+      strcmp(event, "trim_forgiven") == 0 ? "data" : "control";
+  accumulate_transport_event(event, plane, bytes);
 }
 
 void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
