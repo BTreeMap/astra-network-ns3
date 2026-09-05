@@ -374,6 +374,46 @@ uint64_t RdmaRxQueuePair::AbsorbContiguousFrom(uint64_t expected){
 	return expected;
 }
 
+bool RdmaRxQueuePair::IsRangeSettled(uint64_t start, uint64_t end) const{
+	if (end <= static_cast<uint64_t>(ReceiverNextExpectedSeq))
+		return true;
+	if (m_ooo_ranges.empty())
+		return false;
+	auto it = m_ooo_ranges.upper_bound(start);
+	if (it == m_ooo_ranges.begin())
+		return false;
+	--it;
+	return it->second >= end;
+}
+
+const RdmaRxQueuePair::PulledRange* RdmaRxQueuePair::FindPulledRange(
+		uint64_t start) const{
+	if (m_pulled_ranges.empty())
+		return nullptr;
+	auto it = m_pulled_ranges.find(start);
+	return it == m_pulled_ranges.end() ? nullptr : &it->second;
+}
+
+void RdmaRxQueuePair::RecordPulledRange(uint64_t start, uint64_t end,
+		bool priority){
+	m_pulled_ranges[start] = PulledRange{end, priority};
+}
+
+void RdmaRxQueuePair::ForgiveRange(uint64_t start, uint64_t end){
+	if (start >= end)
+		return;
+	AddOutOfOrderRange(start, end);
+	m_forgiven_bytes += end - start;
+	m_forgiven_ranges++;
+}
+
+void RdmaRxQueuePair::PruneSettledPulls(){
+	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
+	auto it = m_pulled_ranges.begin();
+	while (it != m_pulled_ranges.end() && it->second.end <= expected)
+		it = m_pulled_ranges.erase(it);
+}
+
 /*********************
  * RdmaQueuePairGroup
  ********************/

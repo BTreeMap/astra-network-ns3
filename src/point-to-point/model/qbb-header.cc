@@ -64,6 +64,12 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_TRIM_LASTHOP);
 	}
+	void qbbHeader::SetPullPriority(bool priority){
+		if (priority)
+			flags |= 1 << FLAG_PULL_PRIORITY;
+		else
+			flags &= ~(1 << FLAG_PULL_PRIORITY);
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}
@@ -100,6 +106,9 @@ namespace ns3 {
 	}
 	bool qbbHeader::IsTrimLastHop() const{
 		return (flags >> FLAG_TRIM_LASTHOP) & 1;
+	}
+	bool qbbHeader::IsPullPriority() const{
+		return (flags >> FLAG_PULL_PRIORITY) & 1;
 	}
 
 	TypeId

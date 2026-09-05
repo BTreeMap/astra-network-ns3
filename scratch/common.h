@@ -1131,8 +1131,15 @@ void SetConfig() {
   }
 }
 
+// `recovery_verdict` is the experiment layer's answer to "what do I do with
+// this trimmed range": the transport asks, it never decides. A null callback
+// and `forgiveness` false leave the pull-everything transport untouched.
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
-                  void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t)) {
+                  void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
+                  uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
+                                              uint16_t, uint64_t,
+                                              uint32_t) = nullptr,
+                  bool forgiveness = false) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1418,8 +1425,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("DctcpRateAI",
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetPintSmplThresh(pint_prob);
+      rdmaHw->SetAttribute("Forgiveness", BooleanValue(forgiveness));
       rdmaHw->m_transportEventCallback =
           MakeCallback(&record_host_transport_event);
+      if (recovery_verdict != nullptr)
+        rdmaHw->m_recoveryVerdictCallback = MakeCallback(recovery_verdict);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

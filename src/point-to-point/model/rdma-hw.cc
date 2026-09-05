@@ -8,6 +8,7 @@
 #include "ns3/double.h"
 #include "ns3/data-rate.h"
 #include "ns3/pointer.h"
+#include "ns3/abort.h"
 #include "rdma-hw.h"
 #include "ppp-header.h"
 #include "qbb-header.h"
@@ -80,6 +81,15 @@ TypeId RdmaHw::GetTypeId (void)
 				"go-back-N. Timeout recovery stays go-back-N as the fallback.",
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_selective_retransmission),
+				MakeBooleanChecker())
+		.AddAttribute("Forgiveness",
+				"Ask the recovery-verdict callback what to do with a trimmed "
+				"range instead of always pulling it. Off reproduces the "
+				"pull-everything transport exactly. Requires "
+				"SelectiveRetransmission: a forgiven range is absorbed as an "
+				"accepted out-of-order range.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_forgiveness),
 				MakeBooleanChecker())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
@@ -219,6 +229,10 @@ void RdmaHw::SetNode(Ptr<Node> node){
 	m_node = node;
 }
 void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
+	NS_ABORT_MSG_IF(m_forgiveness && !m_selective_retransmission,
+		"Forgiveness needs SelectiveRetransmission: under go-back-N the "
+		"receiver never consults its out-of-order ranges, so a forgiven range "
+		"would be pulled forever");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -388,37 +402,53 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
-		qbbHeader seqh;
-		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
-		seqh.SetPG(ch.udp.pg);
-		seqh.SetSport(ch.udp.dport);
-		seqh.SetDport(ch.udp.sport);
-		seqh.SetIntHeader(ch.udp.ih);
-		if (ecnbits)
-			seqh.SetCnp();
-
-		Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
-		newp->AddHeader(seqh);
-
-		Ipv4Header head;	// Prepare IPv4 header
-		head.SetDestination(Ipv4Address(ch.sip));
-		head.SetSource(Ipv4Address(ch.dip));
-		head.SetProtocol(x == 1 ? 0xFC : 0xFD); //ack=0xFC nack=0xFD
-		head.SetTtl(64);
-		// UEC 1.0.3 Table 3-76: PDS ACKs and NACKs use DSCP_CONTROL (TC_high) and
-		// MUST NOT be marked as trimmable.
-		head.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
-		head.SetPayloadSize(newp->GetSize());
-		head.SetIdentification(rxQp->m_ipid++);
-
-		newp->AddHeader(head);
-		AddHeader(newp, 0x800);	// Attach PPP header
-		// send
-		uint32_t nic_idx = GetNicIdxOfRxQp(rxQp);
-		m_nic[nic_idx].dev->RdmaEnqueueHighPrioQ(newp);
-		m_nic[nic_idx].dev->TriggerTransmit();
+		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.ih, x == 2, ecnbits != 0);
 	}
 	return 0;
+}
+
+// The receiver's cumulative acknowledgement, shared by the in-order data path
+// and the forgiveness fork. A forgiven non-last-hop trim leaves a debt to
+// congestion control here: the next ACK carries FLAG_CNP so ReceiveAck runs
+// cnp_received_mlx exactly as a pulled trim would, and forgiving does not
+// hide congestion.
+void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
+		const IntHeader &ih, bool nack, bool cnp){
+	qbbHeader seqh;
+	seqh.SetSeq(q->ReceiverNextExpectedSeq);
+	seqh.SetPG(pg);
+	seqh.SetSport(sport);
+	seqh.SetDport(dport);
+	seqh.SetIntHeader(ih);
+	if (q->m_pending_cnp){
+		q->m_pending_cnp = false;
+		cnp = true;
+	}
+	if (cnp)
+		seqh.SetCnp();
+
+	Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
+	newp->AddHeader(seqh);
+
+	Ipv4Header head;	// Prepare IPv4 header
+	head.SetDestination(Ipv4Address(destinationIp));
+	head.SetSource(Ipv4Address(sourceIp));
+	head.SetProtocol(nack ? 0xFD : 0xFC); //ack=0xFC nack=0xFD
+	head.SetTtl(64);
+	// UEC 1.0.3 Table 3-76: PDS ACKs and NACKs use DSCP_CONTROL (TC_high) and
+	// MUST NOT be marked as trimmable.
+	head.SetDscp(static_cast<Ipv4Header::DscpType>(kUetDscpControl));
+	head.SetPayloadSize(newp->GetSize());
+	head.SetIdentification(q->m_ipid++);
+
+	newp->AddHeader(head);
+	AddHeader(newp, 0x800);	// Attach PPP header
+	// send
+	uint32_t nic_idx = GetNicIdxOfRxQp(q);
+	m_nic[nic_idx].dev->RdmaEnqueueHighPrioQ(newp);
+	m_nic[nic_idx].dev->TriggerTransmit();
 }
 
 int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch){
@@ -564,7 +594,7 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 // (DSCP_CONTROL / TC_high) and carries only the identity of the lost packet.
 void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop){
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool priority){
 	qbbHeader repair;
 	repair.SetSeq(seq);
 	repair.SetPG(pg);
@@ -573,6 +603,7 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	repair.SetTrimPayloadSize(payloadSize);
 	repair.SetTrimFtd(true);
 	repair.SetTrimLastHop(lastHop);
+	repair.SetPullPriority(priority);
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
@@ -630,6 +661,9 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	if (lastHop) {
 		qp->m_trim_lasthop_notifications++;
 	}
+	if ((ch.ack.flags >> qbbHeader::FLAG_PULL_PRIORITY) & 1) {
+		qp->m_priority_pulls++;
+	}
 	qp->m_trim_recovery_events++;
 	// UEC 1.0.3 p. 356 excludes DSCP_TRIMMED_LASTHOP from the congestion signal
 	// only where RCCC covers the last hop; without RCCC, dropping the cut is
@@ -653,6 +687,55 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	ArmRetransmissionTimeout(qp);
 }
 
+// A trimmed data packet at its destination, under the recovery domain. The
+// range is in exactly one of three states and each has one answer:
+// settled (received, or already forgiven) is acknowledged as a duplicate;
+// pulled repeats the PULL it already sent, at the same priority, because two
+// PULLs at different priorities for one range is not a state the sender can
+// resolve; unknown asks the verdict callback once, and the answer is sticky
+// because forgiving is absorbing and pulling is recorded.
+void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
+		bool lastHop){
+	Ptr<RdmaRxQueuePair> q = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport,
+		ch.udp.pg, true);
+	const uint64_t start = ch.udp.seq;
+	const uint64_t end = start + payloadSize;
+	if (q->IsRangeSettled(start, end)){
+		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.ih, false, false);
+		return;
+	}
+	if (const RdmaRxQueuePair::PulledRange* pulled = q->FindPulledRange(start)){
+		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.seq, payloadSize, lastHop, pulled->priority);
+		return;
+	}
+	const uint8_t verdict = m_recoveryVerdictCallback.IsNull()
+		? static_cast<uint8_t>(VERDICT_PULL)
+		: m_recoveryVerdictCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+			start, payloadSize);
+	if (verdict == VERDICT_FORGIVE){
+		q->ForgiveRange(start, end);
+		if (start == static_cast<uint64_t>(q->ReceiverNextExpectedSeq)){
+			q->ReceiverNextExpectedSeq =
+				static_cast<uint32_t>(q->AbsorbContiguousFrom(start));
+			if (!q->m_pulled_ranges.empty())
+				q->PruneSettledPulls();
+		}
+		// UEC 1.0.3 p. 356 keeps a last-hop trim out of the congestion signal
+		// only where RCCC covers the last hop; this transport has none, so the
+		// debt is owed for every trim the sender would otherwise have seen.
+		q->m_pending_cnp = true;
+		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+			ch.udp.ih, false, false);
+		return;
+	}
+	const bool priority = verdict == VERDICT_PULL_PRIORITY;
+	q->RecordPulledRange(start, end, priority);
+	SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
+		ch.udp.seq, payloadSize, lastHop, priority);
+}
+
 int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	(void)p;
 	// A trimmed data packet reaching its destination. UEC 1.0.3 section 3.5.8.2
@@ -664,9 +747,13 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		// the size of the original packet that was dropped.
 		const uint32_t originalPayload = ch.udp.payload_size > udpHeaderBytes
 			? ch.udp.payload_size - udpHeaderBytes : 0;
+		const bool lastHop = ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop;
+		if (m_forgiveness && originalPayload > 0){
+			ReceiveTrimmedData(ch, originalPayload, lastHop);
+			return 0;
+		}
 		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, originalPayload,
-			ch.GetIpv4Dscp() == kUetDscpTrimmedLastHop);
+			ch.udp.seq, originalPayload, lastHop, false);
 		return 0;
 	}
 
@@ -690,6 +777,10 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			advanced = q->AbsorbContiguousFrom(advanced);
 		}
 		q->ReceiverNextExpectedSeq = static_cast<uint32_t>(advanced);
+		// Emptiness first: this is the per-packet receive path, and the map is
+		// empty in every arm that does not run the recovery domain.
+		if (!q->m_pulled_ranges.empty())
+			q->PruneSettledPulls();
 		if (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx)){
 			// Single step, as the original transport did. A lagging milestone
 			// only means the next packets also generate cumulative ACKs, which
