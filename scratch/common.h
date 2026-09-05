@@ -338,6 +338,13 @@ void accumulate_transport_event(const string &event, const char *plane,
   maybe_flush_transport_event_outputs();
 }
 
+// A host-transport reaction carries no packet, so it contributes a count and
+// no bytes. It rides the control plane because that is what it answers to: a
+// retransmission timeout is the absence of an ACK, a rate cut is a CNP.
+void record_host_transport_event(const char *event) {
+  accumulate_transport_event(event, "control", 0);
+}
+
 void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
                            Ptr<const Packet> packet, uint32_t protocol,
                            int32_t queue) {
@@ -1411,6 +1418,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("DctcpRateAI",
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetPintSmplThresh(pint_prob);
+      rdmaHw->m_transportEventCallback =
+          MakeCallback(&record_host_transport_event);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

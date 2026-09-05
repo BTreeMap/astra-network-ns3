@@ -619,6 +619,8 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	// into spurious transport failure.
 	const bool lastHop = (ch.ack.flags >> qbbHeader::FLAG_TRIM_LASTHOP) & 1;
 	qp->m_trim_notifications++;
+	if (qp->m_first_trim_ns == 0)
+		qp->m_first_trim_ns = Simulator::Now().GetNanoSeconds();
 	qp->m_trimmed_payload_bytes += ch.ack.trim_payload_size;
 	if (isFtdRepair) {
 		qp->m_trim_ftd_repairs++;
@@ -629,10 +631,11 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		qp->m_trim_lasthop_notifications++;
 	}
 	qp->m_trim_recovery_events++;
-	// UEC 1.0.3 section 3.6.4.4: a DSCP_TRIMMED_LASTHOP packet "is not used as a
-	// congestion signal to NSCC" and is not a load-balancing input, because no
-	// alternate path avoids incast at the destination. Loss recovery still runs.
-	if (m_cc_mode == 1 && !lastHop) {
+	// UEC 1.0.3 p. 356 excludes DSCP_TRIMMED_LASTHOP from the congestion signal
+	// only where RCCC covers the last hop; without RCCC, dropping the cut is
+	// what leaves destination incast entirely uncontrolled, so mode 1 reacts to
+	// every trim.
+	if (m_cc_mode == 1) {
 		cnp_received_mlx(qp);
 	}
 	if (m_selective_retransmission){
@@ -819,10 +822,17 @@ void RdmaHw::HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp){
 		return;
 	}
 	qp->m_recovery_retries++;
+	qp->m_timeouts++;
+	ReportTransportEvent("rto_fired");
 	RecoverQueue(qp);
 	const uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].dev->TriggerTransmit();
 	ArmRetransmissionTimeout(qp);
+}
+
+void RdmaHw::ReportTransportEvent(const char* event){
+	if (!m_transportEventCallback.IsNull())
+		m_transportEventCallback(event);
 }
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
@@ -951,9 +961,11 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 	// Account payload attempts independently from the original QP size so
 	// recovery work is visible at both success and failure terminal states.
-	if (is_repair || seq < qp->m_highest_sent)
+	if (is_repair || seq < qp->m_highest_sent){
 		qp->m_retransmitted_bytes += payload_size;
-	else
+		if (qp->m_first_repair_ns == 0)
+			qp->m_first_repair_ns = Simulator::Now().GetNanoSeconds();
+	}else
 		qp->m_highest_sent = seq + payload_size;
 	qp->m_data_attempted_bytes += payload_size;
 
@@ -1019,6 +1031,8 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q){
 }
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
+	q->m_cnp_received++;
+	ReportTransportEvent("cnp_taken");
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update
 	q->mlx.m_decrease_cnp_arrived = true; // set CNP_arrived bit for rate decrease
 	if (q->mlx.m_first_cnp){

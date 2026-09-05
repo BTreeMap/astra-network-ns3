@@ -33,6 +33,20 @@ public:
 	uint32_t m_trim_recovery_events;
 	uint32_t m_stale_trim_notifications;
 	uint32_t m_recovery_retries;
+	// Cumulative retransmission-timeout firings. m_recovery_retries resets on
+	// every acknowledgement advance, so it cannot answer how often the sender
+	// waited out a timeout over the life of the transfer.
+	uint32_t m_timeouts;
+	// Rate cuts taken. Only CC mode 1 (DCQCN) reacts, so this is zero in every
+	// other mode and separates a CC-driven tail from a repair-driven one.
+	uint32_t m_cnp_received;
+	// Priority pulls the sender served. Recovery domain only.
+	uint32_t m_priority_pulls;
+	// Simulated times of the first trim notification received and the first
+	// repair packet sent. Zero means never: no packet can be trimmed or
+	// repaired before the transfer's first send.
+	uint64_t m_first_trim_ns;
+	uint64_t m_first_repair_ns;
 	// Simulated time of the last cumulative-acknowledgement advance (or of
 	// queue-pair creation). The forward-progress deadline measures from here.
 	uint64_t m_last_progress_ns;
@@ -156,6 +170,17 @@ public:
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	// Out-of-order payload ranges accepted under selective retransmission.
 	std::map<uint64_t, uint64_t> m_ooo_ranges;
+	// Recovery-domain forgiveness state. Declared here with the rest of the
+	// receive state so the queue-pair layout changes once; the transitions
+	// that fill it land with the ReceiveTrim fork.
+	// Trimmed ranges with a PULL outstanding, pruned below
+	// ReceiverNextExpectedSeq on every advance.
+	std::map<uint64_t, uint64_t> m_pulled_ranges;
+	uint64_t m_forgiven_bytes;
+	uint32_t m_forgiven_ranges;
+	// A forgiven non-last-hop trim owes congestion control one CNP, carried on
+	// the next ACK. Without it a forgiven trim hides congestion.
+	bool m_pending_cnp;
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();

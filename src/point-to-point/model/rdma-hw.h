@@ -63,6 +63,12 @@ public:
 	QpCompleteCallback m_qpCompleteCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair>, uint32_t> QpFailureCallback;
 	QpFailureCallback m_qpFailureCallback;
+	// Host-transport events no packet trace can observe: a retransmission
+	// timeout firing and a DCQCN rate cut being taken. The scratch layer
+	// aggregates them into transport_summary.csv beside the wire events.
+	typedef Callback<void, const char*> TransportEventCallback;
+	TransportEventCallback m_transportEventCallback;
+	void ReportTransportEvent(const char* event);
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice

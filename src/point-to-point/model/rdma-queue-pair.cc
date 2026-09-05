@@ -44,6 +44,11 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_trim_recovery_events = 0;
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;
+	m_timeouts = 0;
+	m_cnp_received = 0;
+	m_priority_pulls = 0;
+	m_first_trim_ns = 0;
+	m_first_repair_ns = 0;
 	m_last_progress_ns = Simulator::Now().GetNanoSeconds();
 	m_failure_reason = 0;
 	m_failed = false;
@@ -317,6 +322,9 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
+	m_forgiven_bytes = 0;
+	m_forgiven_ranges = 0;
+	m_pending_cnp = false;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){
