@@ -39,7 +39,9 @@ parser.add_argument(
     help="Number of values for each parameter of the search grids",
 )
 parser.add_argument(
-    "--num_refinements", default=1, help="Number of refinement local search runs to be carried out"
+    "--num_refinements",
+    default=1,
+    help="Number of refinement local search runs to be carried out",
 )
 parser.add_argument(
     "--ref_data_fname",
@@ -47,7 +49,9 @@ parser.add_argument(
     help="Filename of the fit reference data, obtained from ns-3",
 )
 parser.add_argument(
-    "--fit_out_fname", default="two-ray-splm-fitted-params.txt", help="Filename of the fit results"
+    "--fit_out_fname",
+    default="two-ray-splm-fitted-params.txt",
+    help="Filename of the fit results",
 )
 parser.add_argument(
     "--c_plus_plus_out_fname",
@@ -59,7 +63,9 @@ parser.add_argument(
     default="FiguresTwoRayThreeGppChCalibration/",
     help="Output folder for the fit results figures",
 )
-parser.add_argument("--epsilon", default=1e-7, help="Tolerance value for the preliminary tests")
+parser.add_argument(
+    "--epsilon", default=1e-7, help="Tolerance value for the preliminary tests"
+)
 parser.add_argument(
     "--preliminary_fit_test",
     default=True,
@@ -193,7 +199,9 @@ def get_ftr_ecdf(params: FtrParams, n_samples: int, db=False):
     else:
         assert v1 == v2 == params.k
 
-    sqrt_gamma = np.sqrt(np.random.gamma(shape=params.m, scale=1 / params.m, size=n_samples))
+    sqrt_gamma = np.sqrt(
+        np.random.gamma(shape=params.m, scale=1 / params.m, size=n_samples)
+    )
 
     # Sample the random phases of the specular components, which are uniformly distributed in [0, 2*PI]
     phi1 = np.random.uniform(low=0, high=1.0, size=n_samples)
@@ -299,7 +307,10 @@ def get_sigma_from_k(k: float) -> float:
 
 
 def fit_ftr_to_reference(
-    ref_data: pd.DataFrame, ref_params_combo: tuple, num_params: int, num_refinements: int
+    ref_data: pd.DataFrame,
+    ref_params_combo: tuple,
+    num_params: int,
+    num_refinements: int,
 ) -> str:
     """!  Estimate the FTR parameters yielding the closest ECDF to the reference one.
 
@@ -341,12 +352,16 @@ def fit_ftr_to_reference(
         # m must be in [0, +inf]
         "m": np.power(
             np.ones(num_params) * 10,
-            np.linspace(start=m_and_k_lb, stop=m_and_k_ub, endpoint=True, num=num_params),
+            np.linspace(
+                start=m_and_k_lb, stop=m_and_k_ub, endpoint=True, num=num_params
+            ),
         ),
         # k must be in [0, +inf]
         "k": np.power(
             np.ones(num_params) * 10,
-            np.linspace(start=m_and_k_lb, stop=m_and_k_ub, endpoint=True, num=num_params),
+            np.linspace(
+                start=m_and_k_lb, stop=m_and_k_ub, endpoint=True, num=num_params
+            ),
         ),
         # delta must be in [0, 1]
         "delta": np.linspace(start=0.0, stop=1.0, endpoint=True, num=num_params),
@@ -400,10 +415,13 @@ def fit_ftr_to_reference(
         }
 
         m_and_k_step = (
-            np.log10(best_params.m) + m_and_k_step - max(0, np.log10(best_params.m) - m_and_k_step)
+            np.log10(best_params.m)
+            + m_and_k_step
+            - max(0, np.log10(best_params.m) - m_and_k_step)
         ) / n_samples
         delta_step = (
-            min(1, best_params.delta + 1 / num_params) - max(0, best_params.delta - 1 / num_params)
+            min(1, best_params.delta + 1 / num_params)
+            - max(0, best_params.delta - 1 / num_params)
         ) / n_samples
 
         for element in product(*finer_search_grid.values()):
@@ -577,9 +595,7 @@ if __name__ == "__main__":
         ad_measures = []
 
         for params_comb in product(scenarios, is_los, frequencies):
-            data_query = (
-                "scen == @params_comb[0] and cond == @params_comb[1] and fc == @params_comb[2]"
-            )
+            data_query = "scen == @params_comb[0] and cond == @params_comb[1] and fc == @params_comb[2]"
 
             # Load corresponding reference data
             ref_data = df.query(data_query)
@@ -597,15 +613,19 @@ if __name__ == "__main__":
             ftr_ecdf = get_ftr_ecdf(params, len(ref_data), db=True)
 
             # Compute the AD measure
-            ad_meas = compute_anderson_darling_measure(np.sort(ref_data["gain"]), ftr_ecdf)
+            ad_meas = compute_anderson_darling_measure(
+                np.sort(ref_data["gain"]), ftr_ecdf
+            )
             ad_measures.append(np.sqrt(ad_meas))
 
             sns.ecdfplot(data=ref_data, x="gain", label="38.901 reference model")
-            sns.ecdfplot(ftr_ecdf, label=f"Fitted FTR, sqrt(AD)={round(np.sqrt(ad_meas), 2)}")
+            sns.ecdfplot(
+                ftr_ecdf, label=f"Fitted FTR, sqrt(AD)={round(np.sqrt(ad_meas), 2)}"
+            )
             plt.xlabel("End-to-end channel gain due to small scale fading [dB]")
             plt.legend()
             plt.savefig(
-                f"{figs_folder}{params_comb[0]}_{params_comb[1]}_{params_comb[2]/1e9}GHz_fit.png",
+                f"{figs_folder}{params_comb[0]}_{params_comb[1]}_{params_comb[2] / 1e9}GHz_fit.png",
                 dpi=500,
                 bbox_inches="tight",
             )

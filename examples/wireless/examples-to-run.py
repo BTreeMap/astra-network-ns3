@@ -8,13 +8,41 @@
 # See test.py for more information.
 cpp_examples = [
     ("mixed-wired-wireless", "True", "True"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::AarfcdWifiManager", "True", "True"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::AmrrWifiManager", "True", "False"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::CaraWifiManager", "True", "False"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::IdealWifiManager", "True", "False"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::MinstrelWifiManager", "True", "False"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::OnoeWifiManager", "True", "False"),
-    ("wifi-multirate --totalTime=0.3s --rateManager=ns3::RraaWifiManager", "True", "False"),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::AarfcdWifiManager",
+        "True",
+        "True",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::AmrrWifiManager",
+        "True",
+        "False",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::CaraWifiManager",
+        "True",
+        "False",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::IdealWifiManager",
+        "True",
+        "False",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::MinstrelWifiManager",
+        "True",
+        "False",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::OnoeWifiManager",
+        "True",
+        "False",
+    ),
+    (
+        "wifi-multirate --totalTime=0.3s --rateManager=ns3::RraaWifiManager",
+        "True",
+        "False",
+    ),
     ("wifi-adhoc", "False", "True"),  # Takes too long to run
     ("wifi-ap --verbose=0", "True", "True"),  # Don't let it spew to stdout
     ("wifi-clear-channel-cmu", "False", "True"),  # Requires specific hardware

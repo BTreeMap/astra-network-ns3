@@ -7,8 +7,16 @@
 #
 # See test.py for more information.
 cpp_examples = [
-    ("nsclick-simple-lan --clickConfigFolder=../../src/click/examples", "NSCLICK == True", "False"),
-    ("nsclick-raw-wlan --clickConfigFolder=../../src/click/examples", "NSCLICK == True", "False"),
+    (
+        "nsclick-simple-lan --clickConfigFolder=../../src/click/examples",
+        "NSCLICK == True",
+        "False",
+    ),
+    (
+        "nsclick-raw-wlan --clickConfigFolder=../../src/click/examples",
+        "NSCLICK == True",
+        "False",
+    ),
     (
         "nsclick-udp-client-server-csma --clickConfigFolder=../../src/click/examples",
         "NSCLICK == True",
@@ -19,8 +27,16 @@ cpp_examples = [
         "NSCLICK == True",
         "False",
     ),
-    ("nsclick-routing --clickConfigFolder=../../src/click/examples", "NSCLICK == True", "False"),
-    ("nsclick-defines --clickConfigFolder=../../src/click/examples", "NSCLICK == True", "False"),
+    (
+        "nsclick-routing --clickConfigFolder=../../src/click/examples",
+        "NSCLICK == True",
+        "False",
+    ),
+    (
+        "nsclick-defines --clickConfigFolder=../../src/click/examples",
+        "NSCLICK == True",
+        "False",
+    ),
 ]
 
 # A list of Python examples to run in order to ensure that they remain

@@ -372,7 +372,10 @@ def make_test(moduledir, modname):
         MODULE=modname,
         CAPITALIZED="".join([word.capitalize() for word in name_parts]),
         COMPOUND="".join(
-            [word.capitalize() if index > 0 else word for index, word in enumerate(name_parts)]
+            [
+                word.capitalize() if index > 0 else word
+                for index, word in enumerate(name_parts)
+            ]
         ),
     )
 
@@ -430,7 +433,14 @@ def make_module(modpath, modname):
 
     print("Creating module {}".format(modulepath))
 
-    functions = (make_cmakelists, make_model, make_test, make_helper, make_examples, make_doc)
+    functions = (
+        make_cmakelists,
+        make_model,
+        make_test,
+        make_helper,
+        make_examples,
+        make_doc,
+    )
 
     try:
         modulepath.mkdir(parents=True)
@@ -444,7 +454,9 @@ def make_module(modpath, modname):
         if modulepath.exists():
             shutil.rmtree(modulepath)
 
-        print("Creating module {!r} failed: {}".format(modname, str(e)), file=sys.stderr)
+        print(
+            "Creating module {!r} failed: {}".format(modname, str(e)), file=sys.stderr
+        )
 
         return False
 

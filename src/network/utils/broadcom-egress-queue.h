@@ -86,8 +86,16 @@ namespace ns3 {
   		NS_LOG_TEMPLATE_DECLARE; //!< the log component
 		uint32_t m_bytesInQueue[fCnt];
 		uint32_t m_bytesInQueueTotal;
+		// TC_med is scheduled against the TC_low aggregate by served bytes so the
+		// trimmed class cannot exceed its configured share of the link.
+		bool MedWithinShare() const;
+		void AccountWeightedShare(uint32_t qIndex, uint32_t bytes);
+
 		uint32_t m_rrlast;
 		uint32_t m_qlast;
+		uint32_t m_medPriorityQueue; // TC_med index, qCnt when the tier is unused
+		uint32_t m_medPriorityWeight; // percent of link bandwidth allowed to TC_med
+		int64_t m_medDeficit; // weighted TC_med credit, clamped to ~one MTU
 		std::vector<Ptr<Queue> > m_queues; // uc queues
 
 	protected:

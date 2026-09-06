@@ -84,7 +84,9 @@ def _search_libraries() -> dict:
 
     # Exclude injected windows paths in case of WSL
     # BTW, why Microsoft? Who had this brilliant idea?
-    library_search_paths = list(filter(lambda x: "/mnt/c/" not in x, library_search_paths))
+    library_search_paths = list(
+        filter(lambda x: "/mnt/c/" not in x, library_search_paths)
+    )
 
     # Search for the core library in the search paths
     libraries = []
@@ -101,7 +103,9 @@ def _search_libraries() -> dict:
             libraries += glob.glob(
                 "%s/**/*.%s*" % (search_path, LIBRARY_EXTENSION), recursive=False
             )
-            libraries += glob.glob("%s/*.%s*" % (search_path, LIBRARY_EXTENSION), recursive=False)
+            libraries += glob.glob(
+                "%s/*.%s*" % (search_path, LIBRARY_EXTENSION), recursive=False
+            )
 
     del search_path, library_search_paths
 
@@ -126,7 +130,9 @@ def _search_libraries() -> dict:
 def search_libraries(library_name: str) -> list:
     libraries_map = _search_libraries()
     trimmed_library_name = trim_library_path(library_name)
-    matched_names = list(filter(lambda x: trimmed_library_name in x, libraries_map.keys()))
+    matched_names = list(
+        filter(lambda x: trimmed_library_name in x, libraries_map.keys())
+    )
     matched_libraries = []
 
     if matched_names:
@@ -209,7 +215,9 @@ def extract_library_include_dirs(library_name: str, prefix: str) -> tuple:
         defines += add_library_defines(linked_library)
 
         # If it is part of the system directories, try to find it
-        system_include_dir = os.path.dirname(linked_library_path).replace(lib, "include")
+        system_include_dir = os.path.dirname(linked_library_path).replace(
+            lib, "include"
+        )
         if os.path.exists(system_include_dir):
             linked_libs_include_dirs.add(system_include_dir)
 
@@ -218,7 +226,9 @@ def extract_library_include_dirs(library_name: str, prefix: str) -> tuple:
                 "." + LIBRARY_EXTENSION, ""
             )
             if os.path.exists(os.path.join(system_include_dir, linked_library_name)):
-                linked_libs_include_dirs.add(os.path.join(system_include_dir, linked_library_name))
+                linked_libs_include_dirs.add(
+                    os.path.join(system_include_dir, linked_library_name)
+                )
 
         # In case it isn't, include new include directories based on the path
         def add_parent_dir_recursively(x: str, y: int) -> None:
@@ -244,7 +254,9 @@ def find_ns3_from_lock_file(lock_file: str) -> (str, list, str):
     # If we find a lock file, load the ns-3 modules from it
     # Should be the case when running from the source directory
     exec(open(lock_file).read(), {}, values)
-    suffix = "-" + values["BUILD_PROFILE"] if values["BUILD_PROFILE"] != "release" else ""
+    suffix = (
+        "-" + values["BUILD_PROFILE"] if values["BUILD_PROFILE"] != "release" else ""
+    )
     modules = list(
         map(
             lambda x: x.replace("ns3-", ""),
@@ -253,7 +265,8 @@ def find_ns3_from_lock_file(lock_file: str) -> (str, list, str):
     )
     prefix = values["out_dir"]
     libraries = {
-        os.path.splitext(os.path.basename(x))[0]: x for x in os.listdir(os.path.join(prefix, "lib"))
+        os.path.splitext(os.path.basename(x))[0]: x
+        for x in os.listdir(os.path.join(prefix, "lib"))
     }
     version = values["VERSION"]
 
@@ -269,7 +282,8 @@ def find_ns3_from_lock_file(lock_file: str) -> (str, list, str):
         for module in modules_to_filter:
             filtered_in_modules += list(
                 filter(
-                    lambda x: "-".join([version, module, *suffix]) in x, libraries_to_filter.keys()
+                    lambda x: "-".join([version, module, *suffix]) in x,
+                    libraries_to_filter.keys(),
                 )
             )
         for library in list(libraries_to_filter.keys()):
@@ -285,7 +299,8 @@ def find_ns3_from_lock_file(lock_file: str) -> (str, list, str):
         library_name = f"libns{version}-{module}{suffix}"
         if library_name not in libraries:
             raise Exception(
-                f"Missing library {library_name}\n", "Build all modules with './ns3 build'"
+                f"Missing library {library_name}\n",
+                "Build all modules with './ns3 build'",
             )
         libraries_to_load.append(libraries[library_name])
     return prefix, libraries_to_load, version
@@ -362,7 +377,9 @@ def find_ns3_from_search() -> (str, list, str):
     # Filter out module names
     modules = set([filter_module_name(library) for library in libraries])
 
-    def filter_in_newest_ns3_libraries(libraries_to_filter: list, modules_to_filter: list) -> tuple:
+    def filter_in_newest_ns3_libraries(
+        libraries_to_filter: list, modules_to_filter: list
+    ) -> tuple:
         newest_version_found = ""
         # Filter out older ns-3 libraries
         for module in list(modules_to_filter):
@@ -383,7 +400,9 @@ def find_ns3_from_search() -> (str, list, str):
             if not newest_version_found:
                 newest_version_found = newest_version
             else:
-                newest_version_found = get_newest_version([newest_version, newest_version_found])
+                newest_version_found = get_newest_version(
+                    [newest_version, newest_version_found]
+                )
                 if newest_version != newest_version_found:
                     raise Exception(
                         f"Incompatible versions of the ns-3 module '{module}' were found: {newest_version} != {newest_version_found}."
@@ -411,7 +430,9 @@ def load_modules():
     libraries_to_load = []
 
     # Search for prefix to ns-3 build, modules and respective libraries plus version
-    ret = find_ns3_from_search() if not lock_file else find_ns3_from_lock_file(lock_file)
+    ret = (
+        find_ns3_from_search() if not lock_file else find_ns3_from_lock_file(lock_file)
+    )
 
     # Unpack returned values
     prefix, libraries, version = ret
@@ -424,12 +445,18 @@ def load_modules():
         for ns3_library in libraries:
             _, _, linked_libraries = extract_linked_libraries(ns3_library, prefix)
             linked_libraries = list(
-                filter(lambda x: "libns3" in x and ns3_library not in x, linked_libraries)
+                filter(
+                    lambda x: "libns3" in x and ns3_library not in x, linked_libraries
+                )
             )
-            linked_libraries = list(map(lambda x: os.path.basename(x), linked_libraries))
+            linked_libraries = list(
+                map(lambda x: os.path.basename(x), linked_libraries)
+            )
             module_dependencies[os.path.basename(ns3_library)] = linked_libraries
 
-        def modules_that_can_be_loaded(module_dependencies, pending_modules, current_modules):
+        def modules_that_can_be_loaded(
+            module_dependencies, pending_modules, current_modules
+        ):
             modules = []
             for pending_module in pending_modules:
                 can_be_loaded = True
@@ -443,7 +470,11 @@ def load_modules():
             return modules
 
         def dependency_order(
-            module_dependencies, pending_modules, current_modules, step_number=0, steps={}
+            module_dependencies,
+            pending_modules,
+            current_modules,
+            step_number=0,
+            steps={},
         ):
             if len(pending_modules) == 0:
                 return steps
@@ -456,7 +487,11 @@ def load_modules():
                 pending_modules.remove(module)
                 current_modules.append(module)
             return dependency_order(
-                module_dependencies, pending_modules, current_modules, step_number + 1, steps
+                module_dependencies,
+                pending_modules,
+                current_modules,
+                step_number + 1,
+                steps,
             )
 
         sorted_libraries = []

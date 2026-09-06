@@ -45,7 +45,9 @@ def main(argv):
     # But since this is a realtime script, don't allow the user to mess with
     # that.
     #
-    ns.GlobalValue.Bind("SimulatorImplementationType", ns.StringValue("ns3::RealtimeSimulatorImpl"))
+    ns.GlobalValue.Bind(
+        "SimulatorImplementationType", ns.StringValue("ns3::RealtimeSimulatorImpl")
+    )
 
     #
     # Explicitly create the nodes required by the topology (shown above).

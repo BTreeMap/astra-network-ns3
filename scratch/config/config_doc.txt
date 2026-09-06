@@ -55,4 +55,5 @@ PMAX_MAP 3 25000000000 0.2 50000000000 0.2 100000000000 0.2 {a map from link ban
 BUFFER_SIZE 32 {buffer size per switch}
 QLEN_MON_FILE mix/qlen.txt {output file: result of qlen of each port}
 QLEN_MON_START 2000000000 {start time of dumping qlen}
+QLEN_MON_INTERVAL 1000 {interval between queue-monitor samples}
 QLEN_MON_END 2010000000 {end time of dumping qlen}

@@ -28,7 +28,11 @@ cpp_examples = [
     ("wifi-phy-configuration --testCase=18", "True", "False"),
     ("wifi-phy-configuration --testCase=19", "True", "False"),
     ("wifi-phy-configuration --testCase=20", "True", "False"),
-    ("wifi-manager-example --wifiManager=Aarf --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Aarf --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Aarf --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -44,7 +48,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Aarf --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Aarf --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Aarf --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -55,7 +63,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Aarfcd --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Aarfcd --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Aarfcd --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -86,7 +98,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Amrr --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Amrr --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Amrr --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -102,7 +118,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Amrr --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Amrr --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Amrr --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -113,7 +133,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Arf --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Arf --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Arf --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -129,7 +153,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Arf --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Arf --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Arf --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -140,7 +168,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Cara --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Cara --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Cara --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -156,7 +188,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Cara --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Cara --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Cara --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -167,7 +203,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Onoe --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Onoe --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Onoe --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -183,7 +223,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Onoe --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Onoe --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Onoe --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -194,7 +238,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Rraa --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Rraa --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Rraa --standard=802.11a --rtsThreshold=0 --stepTime=0.1",
         "True",
@@ -210,7 +258,11 @@ cpp_examples = [
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Rraa --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Rraa --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Rraa --standard=802.11p-10MHz --stepTime=0.1",
         "True",
@@ -601,13 +653,21 @@ cpp_examples = [
         "False",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Ideal --standard=802.11a --stepTime=0.1", "True", "True"),
+    (
+        "wifi-manager-example --wifiManager=Ideal --standard=802.11a --stepTime=0.1",
+        "True",
+        "True",
+    ),
     (
         "wifi-manager-example --wifiManager=Ideal --standard=802.11b --serverChannelWidth=22 --clientChannelWidth=22 --stepTime=0.1",
         "True",
         "False",
     ),
-    ("wifi-manager-example --wifiManager=Ideal --standard=802.11g --stepTime=0.1", "True", "False"),
+    (
+        "wifi-manager-example --wifiManager=Ideal --standard=802.11g --stepTime=0.1",
+        "True",
+        "False",
+    ),
     (
         "wifi-manager-example --wifiManager=Ideal --standard=802.11p-10MHz --stepTime=0.1",
         "True",

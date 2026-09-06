@@ -95,7 +95,12 @@ def read_config_file():
         dot_ns3rc_path = os.path.expanduser("~/") + dot_ns3rc_name
         if not os.path.exists(dot_ns3rc_path):
             # Return all of the default values if the .ns3rc file can't be found.
-            return (config_file_exists, modules_enabled, examples_enabled, tests_enabled)
+            return (
+                config_file_exists,
+                modules_enabled,
+                examples_enabled,
+                tests_enabled,
+            )
 
     config_file_exists = True
 
@@ -107,10 +112,14 @@ def read_config_file():
 
     # Read in whether examples should be enabled or not.
     value_if_missing = False
-    examples_enabled = get_bool_from_file(dot_ns3rc_path, "examples_enabled", value_if_missing)
+    examples_enabled = get_bool_from_file(
+        dot_ns3rc_path, "examples_enabled", value_if_missing
+    )
 
     # Read in whether tests should be enabled or not.
     value_if_missing = False
-    tests_enabled = get_bool_from_file(dot_ns3rc_path, "tests_enabled", value_if_missing)
+    tests_enabled = get_bool_from_file(
+        dot_ns3rc_path, "tests_enabled", value_if_missing
+    )
 
     return (config_file_exists, modules_enabled, examples_enabled, tests_enabled)

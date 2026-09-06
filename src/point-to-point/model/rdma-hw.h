@@ -11,6 +11,16 @@
 
 namespace ns3 {
 
+enum class RdmaFailureReason : uint32_t {
+	TimeoutRetryExhausted = 1,
+	TrimRetryExhausted,
+	// Cumulative acknowledgement made no progress within the configured
+	// deadline even though recovery signals kept arriving. This is the
+	// bound the retry budget cannot provide once NACKs and trim
+	// notifications are (correctly) exempt from it.
+	NoForwardProgress,
+};
+
 struct RdmaInterfaceMgr{
 	Ptr<QbbNetDevice> dev;
 	Ptr<RdmaQueuePairGroup> qpGrp;
@@ -37,6 +47,13 @@ public:
 	bool m_backto0;
 	uint64_t m_retransmission_timeout_ns;
 	uint32_t m_max_retransmission_retries;
+	uint64_t m_no_progress_timeout_ns;
+	bool m_selective_retransmission;
+	// Recovery-domain bounded loss. The transport never decides what may be
+	// forgiven: it asks the verdict callback, which owns eligibility, the
+	// step, and the budget. Requires selective retransmission, because a
+	// forgiven range is absorbed as an accepted out-of-order range.
+	bool m_forgiveness;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -51,6 +68,26 @@ public:
 	QpCompleteCallback m_qpCompleteCallback;
 	typedef Callback<void, Ptr<RdmaQueuePair>, uint32_t> QpFailureCallback;
 	QpFailureCallback m_qpFailureCallback;
+	// Host-transport events no packet trace can observe: a retransmission
+	// timeout firing and a DCQCN rate cut being taken. The scratch layer
+	// aggregates them into transport_summary.csv beside the wire events.
+	typedef Callback<void, const char*, uint64_t> TransportEventCallback;
+	TransportEventCallback m_transportEventCallback;
+	void ReportTransportEvent(const char* event, uint64_t bytes);
+
+	// What the receiver does with a trimmed range it has no decision for.
+	// The transport is semantics-blind: it never reads a training step, a
+	// critical-learning-regime label, or a budget.
+	enum RecoveryVerdict : uint8_t {
+		VERDICT_PULL = 0,
+		VERDICT_FORGIVE = 1,
+		VERDICT_PULL_PRIORITY = 2,
+	};
+	// (sip, dip, sport, dport, seq, len) -> RecoveryVerdict. Unset means pull,
+	// which is the behaviour of a transport with no recovery domain at all.
+	typedef Callback<uint8_t, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
+		uint32_t> RecoveryVerdictCallback;
+	RecoveryVerdictCallback m_recoveryVerdictCallback;
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice
@@ -67,6 +104,7 @@ public:
 	int ReceiveUdp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveCnp(Ptr<Packet> p, CustomHeader &ch);
 	int ReceiveAck(Ptr<Packet> p, CustomHeader &ch); // handle both ACK and NACK
+	int ReceiveTrim(Ptr<Packet> p, CustomHeader &ch);
 	int Receive(Ptr<Packet> p, CustomHeader &ch); // callback function that the QbbNetDevice should use when receive packets. Only NIC can call this function. And do not call this upon PFC
 
 	void PCIePause(uint32_t nic_idx, uint32_t qIndex);
@@ -80,10 +118,21 @@ public:
 	static uint16_t EtherToPpp (uint16_t protocol);
 
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
+	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch,
+		bool isFtdRepair);
+	void SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool priority);
+	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
+		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
+		const IntHeader &ih, bool nack, bool cnp);
+	void ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
+		bool lastHop);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
 	void HandleRetransmissionTimeout(Ptr<RdmaQueuePair> qp);
+	bool EnforceProgressDeadline(Ptr<RdmaQueuePair> qp);
 	void SetLinkDown(Ptr<QbbNetDevice> dev);
 
 	// call this function after the NIC is setup

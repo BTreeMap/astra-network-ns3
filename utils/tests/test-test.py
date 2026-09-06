@@ -113,13 +113,18 @@ def main(argv):
         "--xml=t_opt.xml && rm t_opt.xml",
     ]
 
-    configure_string = sys.executable + " ns3 configure --enable-tests --enable-examples"
+    configure_string = (
+        sys.executable + " ns3 configure --enable-tests --enable-examples"
+    )
     clean_string = sys.executable + " ns3 clean"
     cmd_execute_list = [
-        "%s && %s test.py %s && %s" % (configure_string, sys.executable, option, clean_string)
+        "%s && %s test.py %s && %s"
+        % (configure_string, sys.executable, option, clean_string)
         for option in test_cases
     ]
-    runner = TestBaseClass(argv[1:], "Test suite for the ns-3 unit test runner", "test-py")
+    runner = TestBaseClass(
+        argv[1:], "Test suite for the ns-3 unit test runner", "test-py"
+    )
     return runner.runtests(cmd_execute_list)
 
 

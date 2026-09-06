@@ -8,6 +8,7 @@
 #include <ns3/event-id.h>
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
+#include <map>
 #include <vector>
 
 namespace ns3 {
@@ -23,10 +24,37 @@ public:
 	uint64_t m_highest_sent;
 	uint64_t m_data_attempted_bytes;
 	uint64_t m_retransmitted_bytes;
+	uint64_t m_trimmed_payload_bytes;
 	uint32_t m_recovery_events;
-	uint32_t m_timeout_retries;
+	uint32_t m_trim_notifications;
+	uint32_t m_trim_ftd_repairs;
+	uint32_t m_trim_bts_notifications;
+	uint32_t m_trim_lasthop_notifications;
+	uint32_t m_trim_recovery_events;
+	uint32_t m_stale_trim_notifications;
+	uint32_t m_recovery_retries;
+	// Cumulative retransmission-timeout firings. m_recovery_retries resets on
+	// every acknowledgement advance, so it cannot answer how often the sender
+	// waited out a timeout over the life of the transfer.
+	uint32_t m_timeouts;
+	// Rate cuts taken. Only CC mode 1 (DCQCN) reacts, so this is zero in every
+	// other mode and separates a CC-driven tail from a repair-driven one.
+	uint32_t m_cnp_received;
+	// Priority pulls the sender served. Recovery domain only.
+	uint32_t m_priority_pulls;
+	// Simulated times of the first trim notification received and the first
+	// repair packet sent. Zero means never: no packet can be trimmed or
+	// repaired before the transfer's first send.
+	uint64_t m_first_trim_ns;
+	uint64_t m_first_repair_ns;
+	// Simulated time of the last cumulative-acknowledgement advance (or of
+	// queue-pair creation). The forward-progress deadline measures from here.
+	uint64_t m_last_progress_ns;
 	uint32_t m_failure_reason;
 	bool m_failed;
+	// Selective repair: merged byte ranges awaiting retransmission, always
+	// clamped above snd_una. GetNxtPacket serves these before new data.
+	std::map<uint64_t, uint64_t> m_repair_ranges;
 	EventId m_retransmissionTimer;
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -100,6 +128,10 @@ public:
 	void SetVarWin(bool v);
 	void SetAppNotifyCallback(Callback<void> notifyAppFinish);
 	void SetAppSentCallback(Callback<void> notifyAppSent);
+	void AddRepairRange(uint64_t start, uint64_t end);
+	uint64_t TakeRepairSegment(uint64_t max_bytes, uint64_t &start);
+	void DropAcknowledgedRepairs();
+	uint64_t RepairBytesLeft();
 
 	uint64_t GetBytesLeft();
 	uint64_t GetInitialSize();
@@ -136,10 +168,39 @@ public:
 	int32_t m_milestone_rx;
 	uint32_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
+	// Out-of-order payload ranges accepted under selective retransmission.
+	std::map<uint64_t, uint64_t> m_ooo_ranges;
+	// Recovery-domain forgiveness state.
+	struct PulledRange {
+		uint64_t end;
+		// The PULL already sent for this range. A repeated trim must repeat
+		// the same request, or one range could be pulled at two priorities.
+		bool priority;
+	};
+	// Trimmed ranges with a PULL outstanding, keyed by start. A repair
+	// re-segmenter can chop a merged range at a boundary no trim used, so
+	// entries are not assumed packet-aligned with the trims that arrive.
+	std::map<uint64_t, PulledRange> m_pulled_ranges;
 
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);
+	void AddOutOfOrderRange(uint64_t start, uint64_t end);
+	uint64_t AbsorbContiguousFrom(uint64_t expected);
+	// Bytes of [start, end) the receiver has not accepted: neither below the
+	// cumulative sequence nor inside an accepted out-of-order range,
+	// forgiveness included. Exactly the count AddOutOfOrderRange would
+	// absorb, so a ledger charged this figure charges what it takes. Zero
+	// means the range is settled and the trim is a duplicate.
+	uint64_t UnsettledBytes(uint64_t start, uint64_t end) const;
+	// The outstanding PULL covering an offset, or nullptr when none is. The
+	// offset need not be the recorded start: a re-segmented repair can trim a
+	// range that begins inside one already pulled.
+	const PulledRange* FindPulledRange(uint64_t offset) const;
+	void RecordPulledRange(uint64_t start, uint64_t end, bool priority);
+	// Drop every pulled range the cumulative sequence has passed. Callers
+	// must check emptiness first: this runs on the receive path.
+	void PruneSettledPulls();
 };
 
 class RdmaQueuePairGroup : public Object {

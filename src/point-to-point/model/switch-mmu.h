@@ -40,6 +40,11 @@ public:
 	void ConfigHdrm(uint32_t port, uint32_t size);
 	void ConfigNPort(uint32_t n_port);
 	void ConfigBufferSize(uint32_t size);
+	// Per-queue egress drop threshold, in bytes. UEC 1.0.3 section 4.1 models
+	// trimming against per-queue thresholds ("queue_trimmable.drop_threshold",
+	// "queue_trimmed.drop_threshold"), so the trimmable and trimmed classes must
+	// be sizeable independently. Zero leaves a queue unbounded.
+	void ConfigEgressThreshold(uint32_t qIndex, uint32_t bytes);
 
 	// config
 	uint32_t node_id;
@@ -52,6 +57,7 @@ public:
 	double pmax[pCnt];
 	uint32_t total_hdrm;
 	uint32_t total_rsrv;
+	uint32_t egress_threshold[qCnt]; // 0 = unbounded
 
 	// runtime
 	uint32_t shared_used_bytes;

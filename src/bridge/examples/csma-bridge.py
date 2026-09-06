@@ -72,7 +72,9 @@ def main(argv):
     switchDevices = ns.NetDeviceContainer()
 
     for i in range(4):
-        link = csma.Install(ns.NodeContainer(ns.NodeContainer(terminals.Get(i)), csmaSwitch))
+        link = csma.Install(
+            ns.NodeContainer(ns.NodeContainer(terminals.Get(i)), csmaSwitch)
+        )
         terminalDevices.Add(link.Get(0))
         switchDevices.Add(link.Get(1))
 

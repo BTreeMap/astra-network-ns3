@@ -27,10 +27,14 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
+#include "ns3/qbb-header.h"
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <cmath>
 #include <limits>
+#include <zstd.h>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -52,7 +56,12 @@ double pause_time = 5, simulator_stop_time = 3.01;
 std::string topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
-std::string transport_event_output_file = "transport_events.csv";
+// The raw per-packet log always exists - keeping the research artifact
+// invariant - and keeps its historic ns-3 CSV syntax; only the container is
+// zstd-compressed.
+std::string transport_event_output_file = "transport_events.csv.zst";
+// Aggregated per-(event, plane) totals; what the analyzer consumes.
+std::string transport_event_summary_output_file = "transport_summary.csv";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -70,6 +79,30 @@ int32_t data_loss_receiver_node = -1;
 uint64_t data_loss_rng_stream = 51;
 uint64_t retransmission_timeout_ns = 0;
 uint32_t max_retransmission_retries = 0;
+uint64_t no_progress_timeout_ns = 0;
+uint32_t selective_retransmission = 0;
+std::string packet_trim_mode = "disabled";
+// UEC 1.0.3 section 4.1.4.1 RECOMMENDS three traffic classes: TC_low for data,
+// TC_med for trimmed packets, TC_high for control. Queue 0 is TC_high here, so
+// the trimmed queue must be a distinct non-zero index.
+uint32_t packet_trim_queue = 2;
+// MIN_TRIM_SIZE in IP payload bytes; UEC 1.0.3 Table 4-1 requires 24 B for UET
+// over UDP/IP so the UDP and PDS request headers survive trimming.
+uint32_t min_trim_size = 24;
+uint32_t packet_trim_lasthop = 1;
+// Percent of egress bandwidth TC_med may take from TC_low. UEC 1.0.3 section 4.1
+// recommends WDRR at 25% and warns that an unrestricted trimmed class can drive
+// congestion collapse.
+uint32_t packet_trim_queue_weight = 25;
+// UEC 1.0.3 section 3.6.4.5: "PFC SHOULD NOT be used anywhere in a best-effort
+// network." Trimming exists to replace lossless operation, so a trimming fabric
+// disables PFC and zeroes the PFC headroom that would otherwise act as a second
+// buffer no pause mechanism ever drains.
+uint32_t enable_pfc = 1;
+// Per-queue egress drop thresholds in bytes (0 = unbounded). These are the
+// queue_trimmable and queue_trimmed drop thresholds of section 4.1.
+uint32_t data_queue_bytes = 0;
+uint32_t trimmed_queue_bytes = 0;
 uint32_t has_win = 1;
 uint32_t global_t = 1;
 uint32_t mi_thresh = 5;
@@ -156,61 +189,312 @@ void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type,
           dev->GetIfIndex(), queue, type);
 }
 
-void write_transport_event(FILE *fout, const char *event,
-                           Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
-                           uint32_t protocol, int32_t queue) {
+// The analyzer reduces transport telemetry to per-(event, plane) counts and
+// byte totals, so the simulator aggregates in memory and periodically
+// rewrites a small summary file. The raw per-packet log survives as a
+// research artifact in its historic ns-3 CSV syntax, but zstd-compressed on
+// a library worker thread (the second CI core): uncompressed and flushed
+// per row it grew past 160 GB per arm, and the write load - not the
+// simulation - is what exhausted shared storage and killed whole runner
+// fleets. If compression ever falls behind, ZSTD_compressStream2 blocks the
+// producer rather than dropping rows.
+FILE *transport_event_summary_file = nullptr;
+map<pair<string, string>, pair<uint64_t, uint64_t>> transport_event_totals;
+FILE *transport_event_raw_file = nullptr;
+ZSTD_CCtx *transport_event_raw_cctx = nullptr;
+string transport_event_raw_pending;
+vector<char> transport_event_raw_scratch;
+time_t transport_event_last_flush = 0;
+// The raw stream is a sequence of independently decompressible zstd frames
+// ("segments"), rotated when a segment's compressed size crosses the limit
+// below. Segments exist so a multi-gigabyte run can ship its raw log
+// incrementally and every shipped piece stays under the 2 GiB
+// release-asset cap; `cat <name>.zst.* | zstd -d` reconstructs the exact
+// historic single-file CSV (the header lives once, in segment .000, so a
+// surviving mid-run segment is still headerless rows in the same syntax).
+// Rotation only ever happens at a row boundary: rows enter the pending
+// buffer whole, and a frame ends only after that buffer fully drains.
+uint32_t transport_event_raw_segment_index = 0;
+uint64_t transport_event_raw_segment_bytes = 0;
+uint64_t transport_event_segment_byte_limit = 1800000000ull;
+
+std::string transport_event_segment_path(uint32_t index) {
+  char suffix[8];
+  snprintf(suffix, sizeof(suffix), ".%03u", index);
+  return transport_event_output_file + suffix;
+}
+
+void flush_transport_event_raw(ZSTD_EndDirective directive) {
+  ZSTD_inBuffer input = {transport_event_raw_pending.data(),
+                         transport_event_raw_pending.size(), 0};
+  bool draining = true;
+  while (draining) {
+    ZSTD_outBuffer output = {transport_event_raw_scratch.data(),
+                             transport_event_raw_scratch.size(), 0};
+    const size_t remaining =
+        ZSTD_compressStream2(transport_event_raw_cctx, &output, &input,
+                             directive);
+    if (ZSTD_isError(remaining)) {
+      std::cerr << "transport event raw stream: "
+                << ZSTD_getErrorName(remaining) << "\n";
+      break;
+    }
+    if (output.pos != 0) {
+      fwrite(transport_event_raw_scratch.data(), 1, output.pos,
+             transport_event_raw_file);
+      transport_event_raw_segment_bytes += output.pos;
+    }
+    // e_flush and e_end must drain the worker completely; e_continue only
+    // needs the pending input accepted.
+    draining = directive == ZSTD_e_continue ? input.pos < input.size
+                                            : remaining != 0;
+  }
+  transport_event_raw_pending.clear();
+}
+
+void rotate_transport_event_raw_segment() {
+  // Seal the current segment as a complete zstd frame and start the next
+  // one on the same compression parameters. A sealed segment is immutable
+  // on disk from this instant - which is the entire coordination protocol
+  // with the mid-run uploader: the existence of segment N+1 is the proof
+  // that segment N may be shipped and deleted.
+  flush_transport_event_raw(ZSTD_e_end);
+  fclose(transport_event_raw_file);
+  transport_event_raw_segment_index++;
+  transport_event_raw_file = fopen(
+      transport_event_segment_path(transport_event_raw_segment_index).c_str(),
+      "wb");
+  if (transport_event_raw_file == nullptr) {
+    // Losing the raw stream must not kill a multi-day simulation: the
+    // summary file carries everything the analyzer needs regardless.
+    std::cerr << "transport event raw stream: cannot open segment "
+              << transport_event_raw_segment_index
+              << "; raw logging stops here\n";
+    ZSTD_freeCCtx(transport_event_raw_cctx);
+    transport_event_raw_cctx = nullptr;
+    return;
+  }
+  ZSTD_CCtx_reset(transport_event_raw_cctx, ZSTD_reset_session_only);
+  transport_event_raw_segment_bytes = 0;
+}
+
+void append_transport_event_raw(const char *row, int length) {
+  if (length <= 0)
+    return;
+  transport_event_raw_pending.append(row, static_cast<size_t>(length));
+  if (transport_event_raw_pending.size() >= (1u << 22))
+    flush_transport_event_raw(ZSTD_e_continue);
+  // Checked after the write path, so a segment can overshoot the limit by
+  // at most one drained burst; the limit leaves ~350 MB of headroom under
+  // the 2 GiB cap for exactly that reason.
+  if (transport_event_raw_segment_bytes >= transport_event_segment_byte_limit)
+    rotate_transport_event_raw_segment();
+}
+
+void finalize_transport_event_raw() {
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  flush_transport_event_raw(ZSTD_e_end);
+  fclose(transport_event_raw_file);
+  ZSTD_freeCCtx(transport_event_raw_cctx);
+  transport_event_raw_cctx = nullptr;
+  transport_event_raw_file = nullptr;
+}
+
+// Rewritten in place on every flush, so the totals are observable while the
+// simulation runs and complete at exit.
+void write_transport_event_summary() {
+  if (transport_event_summary_file == nullptr)
+    return;
+  rewind(transport_event_summary_file);
+  fprintf(transport_event_summary_file, "event,plane,event_count,total_bytes\n");
+  for (const auto &entry : transport_event_totals)
+    fprintf(transport_event_summary_file, "%s,%s,%lu,%lu\n",
+            entry.first.first.c_str(), entry.first.second.c_str(),
+            static_cast<unsigned long>(entry.second.first),
+            static_cast<unsigned long>(entry.second.second));
+  fflush(transport_event_summary_file);
+}
+
+// Optimistic flush: with the per-row fflush gone, land both outputs about
+// once a minute so a hard kill loses at most the trailing window and the
+// artifacts stay inspectable mid-run.
+void maybe_flush_transport_event_outputs() {
+  const time_t now = time(nullptr);
+  if (now - transport_event_last_flush < 60)
+    return;
+  transport_event_last_flush = now;
+  write_transport_event_summary();
+  if (transport_event_raw_cctx != nullptr) {
+    flush_transport_event_raw(ZSTD_e_flush);
+    fflush(transport_event_raw_file);
+  }
+}
+
+void accumulate_transport_event(const string &event, const char *plane,
+                                uint64_t bytes) {
+  auto &totals = transport_event_totals[{event, plane}];
+  totals.first += 1;
+  totals.second += bytes;
+  maybe_flush_transport_event_outputs();
+}
+
+// A host-transport reaction carries no packet, so it contributes a count and
+// no bytes. It rides the control plane because that is what it answers to: a
+// retransmission timeout is the absence of an ACK, a rate cut is a CNP.
+void record_host_transport_event(const char *event, uint64_t bytes) {
+  // A forgiven trim accounts for payload bytes that were never delivered, so
+  // it rides the data plane beside the switch's own trim events. The other
+  // reactions carry no packet and answer to the control plane: a
+  // retransmission timeout is a missing ACK, a rate cut is a CNP.
+  const char *plane =
+      strcmp(event, "trim_forgiven") == 0 ? "data" : "control";
+  accumulate_transport_event(event, plane, bytes);
+}
+
+void write_transport_event(const char *event, Ptr<QbbNetDevice> dev,
+                           Ptr<const Packet> packet, uint32_t protocol,
+                           int32_t queue) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
+  // A trimmed packet rides the UDP protocol number but carries no payload, so
+  // it is reported on the control plane alongside ACKs and NACKs.
+  const bool payload_bearing =
+      protocol == 0x11 && !IsUetTrimmedDscp(ch.GetIpv4Dscp());
+  accumulate_transport_event(event, payload_bearing ? "data" : "control",
+                             packet->GetSize());
+  if (transport_event_raw_cctx == nullptr)
+    return;
   uint16_t source_port = 0;
-  if (protocol == 0x11)
+  uint32_t sequence = 0;
+  if (protocol == 0x11) {
     source_port = ch.udp.sport;
-  else if (protocol == 0xFC || protocol == 0xFD)
+    sequence = ch.udp.seq;
+  } else if (protocol == 0xFC || protocol == 0xFD ||
+             protocol == kUecTrimRepairProtocol ||
+             protocol == kUecTrimNotificationProtocol) {
     source_port = ch.ack.sport;
-  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
-  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
-  fprintf(fout, "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
-          Simulator::Now().GetNanoSeconds(), event,
-          protocol == 0x11 ? "data" : "control", protocol,
-          dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
-          dev->GetIfIndex(), source_host, destination_host, source_port,
-          packet->GetSize(), queue);
-  fflush(fout);
+    sequence = ch.ack.seq;
+  }
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d\n",
+      Simulator::Now().GetNanoSeconds(), event,
+      payload_bearing ? "data" : "control", protocol,
+      dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(),
+      dev->GetIfIndex(), ip_to_node_id(Ipv4Address(ch.sip)),
+      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      packet->GetSize(), queue);
+  append_transport_event_raw(row, length);
 }
 
-void get_transport_event(FILE *fout, const char *event,
-                         Ptr<QbbNetDevice> dev, Ptr<const Packet> packet,
-                         uint32_t protocol) {
-  write_transport_event(fout, event, dev, packet, protocol, -1);
+void get_transport_event(const char *event, Ptr<QbbNetDevice> dev,
+                         Ptr<const Packet> packet, uint32_t protocol) {
+  write_transport_event(event, dev, packet, protocol, -1);
 }
 
-void get_queue_event(FILE *fout, const char *event, Ptr<QbbNetDevice> dev,
+void get_queue_event(const char *event, Ptr<QbbNetDevice> dev,
                      Ptr<const Packet> packet, uint32_t queue) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  write_transport_event(fout, event, dev, packet, ch.l3Prot,
+  write_transport_event(event, dev, packet, ch.l3Prot,
                         static_cast<int32_t>(queue));
 }
 
-void get_switch_drop(FILE *fout, Ptr<SwitchNode> sw,
+void get_switch_drop(Ptr<SwitchNode> sw,
                      Ptr<const Packet> packet, uint32_t reason) {
   CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                   CustomHeader::L4_Header);
   ch.getInt = 1;
   packet->PeekHeader(ch);
-  const uint32_t source_host = ip_to_node_id(Ipv4Address(ch.sip));
-  const uint32_t destination_host = ip_to_node_id(Ipv4Address(ch.dip));
-  const uint16_t source_port = ch.l3Prot == 0x11 ? ch.udp.sport : 0;
-  fprintf(fout, "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,-1\n",
-          Simulator::Now().GetNanoSeconds(),
-          reason == 1 ? "switch_route_drop" : "switch_admission_drop",
-          ch.l3Prot == 0x11 ? "data" : "control", ch.l3Prot,
-          sw->GetId(), sw->GetNodeType(), source_host, destination_host,
-          source_port, packet->GetSize());
-  fflush(fout);
+  const bool trimmed = IsUetTrimmedDscp(ch.GetIpv4Dscp());
+  const bool udp = ch.l3Prot == 0x11;
+  const char *event = "switch_unknown_drop";
+  switch (static_cast<SwitchDropReason>(reason)) {
+  case SwitchDropReason::Route:
+    event = "switch_route_drop";
+    break;
+  case SwitchDropReason::Admission:
+    event = "switch_admission_drop";
+    break;
+  case SwitchDropReason::EgressQueue:
+    event = "switch_egress_queue_drop";
+    break;
+  case SwitchDropReason::TrimmedQueue:
+    // UEC 1.0.3 section 4.1: trimmed packets remain subject to loss at the
+    // trimming switch and at every downstream TC_med queue.
+    event = "switch_trimmed_queue_drop";
+    break;
+  }
+  accumulate_transport_event(event, (udp || trimmed) ? "data" : "control",
+                             packet->GetSize());
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  const uint16_t source_port =
+      udp ? ch.udp.sport : (trimmed ? ch.ack.sport : 0);
+  const uint32_t sequence = udp ? ch.udp.seq : (trimmed ? ch.ack.seq : 0);
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,%s,%s,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
+      Simulator::Now().GetNanoSeconds(), event,
+      (udp || trimmed) ? "data" : "control", ch.l3Prot, sw->GetId(),
+      sw->GetNodeType(), ip_to_node_id(Ipv4Address(ch.sip)),
+      ip_to_node_id(Ipv4Address(ch.dip)), source_port, sequence,
+      packet->GetSize());
+  append_transport_event_raw(row, length);
+}
+
+void get_switch_trim(Ptr<SwitchNode> sw,
+                     Ptr<const Packet> packet, uint32_t trigger) {
+  CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                  CustomHeader::L4_Header);
+  ch.getInt = 1;
+  packet->PeekHeader(ch);
+  // A UEC-conformant trim keeps the original UDP packet, truncated and remarked
+  // DSCP_TRIMMED; the non-UET back-to-sender mode emits its own notification.
+  const bool forwardToDestination = ch.l3Prot == 0x11;
+  // The UDP length field is not modified by trimming, so it still reports the
+  // payload that the trim replaced.
+  const uint32_t trimmed_payload =
+      forwardToDestination
+          ? (ch.udp.payload_size > CustomHeader::GetUdpHeaderSize()
+                 ? ch.udp.payload_size - CustomHeader::GetUdpHeaderSize()
+                 : 0)
+          : ch.ack.trim_payload_size;
+  const char *mode = forwardToDestination ? "ftd" : "bts";
+  const char *reason = "unknown";
+  switch (static_cast<PacketTrimTrigger>(trigger)) {
+  case PacketTrimTrigger::Admission:
+    reason = "admission";
+    break;
+  case PacketTrimTrigger::EgressQueue:
+    reason = "egress_queue";
+    break;
+  case PacketTrimTrigger::AdmissionLastHop:
+    reason = "lasthop_admission";
+    break;
+  case PacketTrimTrigger::EgressQueueLastHop:
+    reason = "lasthop_egress_queue";
+    break;
+  }
+  accumulate_transport_event(string("trim_") + mode + "_" + reason, "data",
+                             trimmed_payload);
+  if (transport_event_raw_cctx == nullptr)
+    return;
+  char row[224];
+  const int length = snprintf(
+      row, sizeof(row), "%lu,trim_%s_%s,data,%u,%u,%u,-1,%u,%u,%u,%u,%u,-1\n",
+      Simulator::Now().GetNanoSeconds(), mode, reason, ch.l3Prot, sw->GetId(),
+      sw->GetNodeType(),
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.sip : ch.dip)),
+      ip_to_node_id(Ipv4Address(forwardToDestination ? ch.dip : ch.sip)),
+      forwardToDestination ? ch.udp.sport : ch.ack.dport,
+      forwardToDestination ? ch.udp.seq : ch.ack.seq, trimmed_payload);
+  append_transport_event_raw(row, length);
 }
 
 uint32_t data_loss_scope_value() {
@@ -222,6 +506,16 @@ uint32_t data_loss_scope_value() {
     return static_cast<uint32_t>(DataLossScope::SwitchToHost);
   if (data_loss_scope == "switch_to_switch")
     return static_cast<uint32_t>(DataLossScope::SwitchToSwitch);
+  return std::numeric_limits<uint32_t>::max();
+}
+
+uint32_t packet_trim_mode_value() {
+  if (packet_trim_mode == "disabled")
+    return static_cast<uint32_t>(PacketTrimMode::Disabled);
+  if (packet_trim_mode == "ftd")
+    return static_cast<uint32_t>(PacketTrimMode::ForwardToDestination);
+  if (packet_trim_mode == "bts")
+    return static_cast<uint32_t>(PacketTrimMode::BackToSender);
   return std::numeric_limits<uint32_t>::max();
 }
 
@@ -244,31 +538,28 @@ void configure_data_loss(Ptr<QbbNetDevice> dev, uint64_t stream_offset) {
   dev->SetAttribute("DataLossErrorModel", PointerValue(model));
 }
 
-void connect_transport_traces(FILE *fout, Ptr<QbbNetDevice> dev) {
+void connect_transport_traces(Ptr<QbbNetDevice> dev) {
+  if (data_loss_duration_ns != 0 ||
+      packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled)) {
+    dev->TraceConnectWithoutContext(
+        "DataPlaneAttempt", MakeBoundCallback(&get_transport_event,
+                                                "data_arrival", dev));
+    dev->TraceConnectWithoutContext(
+        "DataPlaneDeliver", MakeBoundCallback(&get_transport_event,
+                                                "data_deliver", dev));
+    dev->TraceConnectWithoutContext(
+        "DataPlaneLoss", MakeBoundCallback(&get_transport_event,
+                                             "data_injected_drop", dev));
+    dev->TraceConnectWithoutContext(
+        "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event,
+                                                   "control_arrival", dev));
+    dev->TraceConnectWithoutContext(
+        "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event,
+                                                   "control_deliver", dev));
+  }
   dev->TraceConnectWithoutContext(
-      "DataPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
-                                              "data_arrival", dev));
-  dev->TraceConnectWithoutContext(
-      "DataPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
-                                              "data_deliver", dev));
-  dev->TraceConnectWithoutContext(
-      "DataPlaneLoss", MakeBoundCallback(&get_transport_event, fout,
-                                           "data_injected_drop", dev));
-  dev->TraceConnectWithoutContext(
-      "ControlPlaneAttempt", MakeBoundCallback(&get_transport_event, fout,
-                                                 "control_arrival", dev));
-  dev->TraceConnectWithoutContext(
-      "ControlPlaneDeliver", MakeBoundCallback(&get_transport_event, fout,
-                                                 "control_deliver", dev));
-  dev->TraceConnectWithoutContext(
-        "QueueEnqueue", MakeBoundCallback(&get_queue_event, fout,
-                          "queue_enqueue", dev));
-  dev->TraceConnectWithoutContext(
-        "QueueDequeue", MakeBoundCallback(&get_queue_event, fout,
-                          "queue_dequeue", dev));
-  dev->TraceConnectWithoutContext(
-        "QbbDrop", MakeBoundCallback(&get_queue_event, fout,
-                      "qbb_drop", dev));
+      "QbbDrop", MakeBoundCallback(&get_queue_event, "qbb_drop", dev));
 }
 
 struct QlenDistribution {
@@ -326,8 +617,8 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
         //	queue_result[i][j]+=size;
         // queue_result[i][j].add(size);
       }
-      fflush(qlen_output);
-      // fprintf(qlen_output, "\n");
+      // Flush once after the complete sample. Flushing each switch at a
+      // packet-scale cadence can dominate high-rate simulations.
     }
   }
   fflush(qlen_output);
@@ -571,6 +862,26 @@ bool ReadConf(string network_configuration) {
       conf >> retransmission_timeout_ns;
     } else if (key.compare("MAX_RETRANSMISSION_RETRIES") == 0) {
       conf >> max_retransmission_retries;
+    } else if (key.compare("NO_PROGRESS_TIMEOUT_NS") == 0) {
+      conf >> no_progress_timeout_ns;
+    } else if (key.compare("SELECTIVE_RETRANSMISSION") == 0) {
+      conf >> selective_retransmission;
+	} else if (key.compare("PACKET_TRIM_MODE") == 0) {
+	  conf >> packet_trim_mode;
+	} else if (key.compare("PACKET_TRIM_QUEUE") == 0) {
+	  conf >> packet_trim_queue;
+	} else if (key.compare("MIN_TRIM_SIZE") == 0) {
+	  conf >> min_trim_size;
+	} else if (key.compare("PACKET_TRIM_LASTHOP") == 0) {
+	  conf >> packet_trim_lasthop;
+	} else if (key.compare("PACKET_TRIM_QUEUE_WEIGHT") == 0) {
+	  conf >> packet_trim_queue_weight;
+	} else if (key.compare("ENABLE_PFC") == 0) {
+	  conf >> enable_pfc;
+	} else if (key.compare("DATA_QUEUE_BYTES") == 0) {
+	  conf >> data_queue_bytes;
+	} else if (key.compare("TRIMMED_QUEUE_BYTES") == 0) {
+	  conf >> trimmed_queue_bytes;
     } else if (key.compare("CC_MODE") == 0) {
       conf >> cc_mode;
     } else if (key.compare("RATE_DECREASE_INTERVAL") == 0) {
@@ -613,6 +924,10 @@ bool ReadConf(string network_configuration) {
       conf >> pfc_output_file;
     } else if (key.compare("TRANSPORT_EVENT_OUTPUT_FILE") == 0) {
       conf >> transport_event_output_file;
+    } else if (key.compare("TRANSPORT_EVENT_SEGMENT_BYTES") == 0) {
+      conf >> transport_event_segment_byte_limit;
+    } else if (key.compare("TRANSPORT_EVENT_SUMMARY_OUTPUT_FILE") == 0) {
+      conf >> transport_event_summary_output_file;
     } else if (key.compare("LINK_DOWN") == 0) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("ENABLE_TRACE") == 0) {
@@ -650,6 +965,8 @@ bool ReadConf(string network_configuration) {
       conf >> qlen_mon_file;
     } else if (key.compare("QLEN_MON_START") == 0) {
       conf >> qlen_mon_start;
+    } else if (key.compare("QLEN_MON_INTERVAL") == 0) {
+      conf >> qlen_mon_interval;
     } else if (key.compare("QLEN_MON_END") == 0) {
       conf >> qlen_mon_end;
     } else if (key.compare("MULTI_RATE") == 0) {
@@ -695,9 +1012,86 @@ bool ReadConf(string network_configuration) {
     std::cerr << "loss experiments require retransmission timeout and retry budget\n";
     return false;
   }
+  if (packet_trim_mode_value() == std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "PACKET_TRIM_MODE must be disabled, ftd, or bts\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
+    std::cerr << "packet trimming requires retransmission timeout and retry budget\n";
+    return false;
+  }
+  // Trim notifications and NACKs are exempt from the retry budget, so the
+  // budget alone cannot bound a recovery loop that never advances snd_una.
+  // The forward-progress deadline is the liveness bound for that loop class
+  // and is therefore mandatory whenever trimming can generate such signals.
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      no_progress_timeout_ns == 0) {
+    std::cerr << "packet trimming requires NO_PROGRESS_TIMEOUT_NS as the "
+                 "liveness bound for budget-exempt recovery signals\n";
+    return false;
+  }
+  if (selective_retransmission != 0 &&
+      (retransmission_timeout_ns == 0 || max_retransmission_retries == 0)) {
+    std::cerr << "SELECTIVE_RETRANSMISSION requires retransmission timeout and "
+                 "retry budget as its silent-loss fallback\n";
+    return false;
+  }
+  // UEC 1.0.3 section 4.1.4.1: switches MUST place trimmed packets in a traffic
+  // class distinct from untrimmed data, and DSCP_TRIMMED MUST differ from
+  // DSCP_CONTROL. Queue 0 carries DSCP_CONTROL, so TC_med cannot be queue 0.
+  if (packet_trim_queue == 0 || packet_trim_queue > 7) {
+    std::cerr << "PACKET_TRIM_QUEUE must name a TC_med queue in [1,7]\n";
+    return false;
+  }
+  // UEC 1.0.3 Table 4-1: UET over UDP/IP needs 24 B so the UDP header and the
+  // PDS request header survive trimming. The switch additionally raises the
+  // retained prefix to cover any INT header the configured CC algorithm adds.
+  if (min_trim_size < 24) {
+    std::cerr << "MIN_TRIM_SIZE must be at least 24 bytes (UEC 1.0.3 Table 4-1)\n";
+    return false;
+  }
+  if (packet_trim_queue_weight == 0 || packet_trim_queue_weight > 100) {
+    std::cerr << "PACKET_TRIM_QUEUE_WEIGHT must be a percentage in [1,100]\n";
+    return false;
+  }
+  // Headroom only exists to absorb packets already in flight when a PAUSE is
+  // sent. Without PFC nothing ever pauses, so a nonzero headroom is dead buffer
+  // that must fill before any packet can be trimmed or dropped.
+  if (enable_pfc == 0 && headroom_factor != 0) {
+    std::cerr << "HEADROOM_FACTOR must be 0 when ENABLE_PFC is 0; PFC headroom "
+                 "is unreachable buffer in a best-effort fabric\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      enable_pfc != 0) {
+    std::cerr << "packet trimming requires ENABLE_PFC 0; UEC 1.0.3 section "
+                 "3.6.4.5 excludes PFC from best-effort networks\n";
+    return false;
+  }
+  if (packet_trim_mode_value() !=
+          static_cast<uint32_t>(PacketTrimMode::Disabled) &&
+      data_queue_bytes == 0) {
+    std::cerr << "packet trimming requires a bounded DATA_QUEUE_BYTES; an "
+                 "unbounded egress queue can never reject a packet\n";
+    return false;
+  }
+  if (packet_trim_mode_value() ==
+      static_cast<uint32_t>(PacketTrimMode::BackToSender)) {
+    std::cerr << "warning: PACKET_TRIM_MODE bts sends trim metadata back to the "
+                 "source, which UEC 1.0.3 section 4.1 explicitly excludes; use "
+                 "ftd for UET-conformant trimming\n";
+  }
   if (data_loss_rng_stream >
       static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     std::cerr << "DATA_LOSS_RNG_STREAM exceeds ns-3 stream range\n";
+    return false;
+  }
+  if (qlen_mon_interval == 0) {
+    std::cerr << "QLEN_MON_INTERVAL must be positive\n";
     return false;
   }
   return true;
@@ -708,8 +1102,20 @@ void SetConfig() {
 
   Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
   Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
+  Config::SetDefault("ns3::QbbNetDevice::QbbEnabled",
+                     BooleanValue(enable_pfc != 0));
   Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold",
                      BooleanValue(dynamicth));
+
+  // Give trimmed packets their own TC_med scheduling tier only when trimming is
+  // enabled, so baseline runs keep the original two-tier egress discipline.
+  if (packet_trim_mode_value() !=
+      static_cast<uint32_t>(PacketTrimMode::Disabled)) {
+    Config::SetDefault("ns3::BEgressQueue::MediumPriorityQueue",
+                       UintegerValue(packet_trim_queue));
+    Config::SetDefault("ns3::BEgressQueue::MediumPriorityWeight",
+                       UintegerValue(packet_trim_queue_weight));
+  }
 
   // set int_multi
   IntHop::multi = int_multi;
@@ -732,8 +1138,15 @@ void SetConfig() {
   }
 }
 
+// `recovery_verdict` is the experiment layer's answer to "what do I do with
+// this trimmed range": the transport asks, it never decides. A null callback
+// and `forgiveness` false leave the pull-everything transport untouched.
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
-                  void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t)) {
+                  void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
+                  uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
+                                              uint16_t, uint64_t,
+                                              uint32_t) = nullptr,
+                  bool forgiveness = false) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -792,21 +1205,54 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
   NS_LOG_INFO("Create channels.");
 
   FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
-  FILE *transport_event_file = fopen(transport_event_output_file.c_str(), "w");
-  if (pfc_file == nullptr || transport_event_file == nullptr) {
-    std::cerr << "Error: cannot open PFC or transport event output file\n";
+  transport_event_summary_file =
+      fopen(transport_event_summary_output_file.c_str(), "w");
+  // Segment .000 always exists - the research invariant now holds at
+  // segment granularity, and the configured name is the family's base.
+  transport_event_raw_file =
+      fopen(transport_event_segment_path(0).c_str(), "wb");
+  transport_event_raw_cctx = ZSTD_createCCtx();
+  if (pfc_file == nullptr || transport_event_summary_file == nullptr ||
+      transport_event_raw_file == nullptr ||
+      transport_event_raw_cctx == nullptr) {
+    std::cerr << "Error: cannot open PFC or transport event output files\n";
     return false;
   }
-  fprintf(transport_event_file,
-          "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
-      "destination_host,source_port,packet_bytes,queue\n");
+  // The totals must land even when a watchdog exits the run mid-simulation.
+  std::atexit(write_transport_event_summary);
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_compressionLevel, 8);
+  // Long-distance matching folds the workload's periodic collective
+  // patterns; window 2^27 stays within every decoder's no-flags default.
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx,
+                         ZSTD_c_enableLongDistanceMatching, 1);
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_windowLog, 27);
+  // One worker keeps compression off the simulation thread. On a
+  // single-threaded libzstd this parameter is refused and the stream
+  // simply compresses synchronously - correct either way.
+  ZSTD_CCtx_setParameter(transport_event_raw_cctx, ZSTD_c_nbWorkers, 1);
+  transport_event_raw_pending.reserve(1u << 22);
+  transport_event_raw_scratch.resize(ZSTD_CStreamOutSize());
+  transport_event_last_flush = time(nullptr);
+  static const char raw_header[] =
+      "time_ns,event,plane,protocol,node,node_type,interface,source_host,"
+      "destination_host,source_port,sequence,packet_bytes,queue\n";
+  append_transport_event_raw(raw_header, sizeof(raw_header) - 1);
+  std::atexit(finalize_transport_event_raw);
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       sw->SetAttribute("AckHighPrio", UintegerValue(ack_high_prio));
+        sw->SetAttribute("PacketTrimMode",
+                 UintegerValue(packet_trim_mode_value()));
+      sw->SetAttribute("TrimmedQueueIndex", UintegerValue(packet_trim_queue));
+      sw->SetAttribute("MinTrimSize", UintegerValue(min_trim_size));
+      sw->SetAttribute("LastHopTrimCodepoint",
+                       BooleanValue(packet_trim_lasthop != 0));
+      sw->SetAttribute("PfcEnabled", BooleanValue(enable_pfc != 0));
       sw->TraceConnectWithoutContext(
-          "SwitchDrop", MakeBoundCallback(&get_switch_drop,
-                                            transport_event_file, sw));
+          "SwitchDrop", MakeBoundCallback(&get_switch_drop, sw));
+        sw->TraceConnectWithoutContext(
+          "PacketTrim", MakeBoundCallback(&get_switch_trim, sw));
     }
   }
 
@@ -837,8 +1283,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
     Ptr<QbbNetDevice> dst_dev = DynamicCast<QbbNetDevice>(d.Get(1));
     configure_data_loss(src_dev, static_cast<uint64_t>(i) * 2);
     configure_data_loss(dst_dev, static_cast<uint64_t>(i) * 2 + 1);
-    connect_transport_traces(transport_event_file, src_dev);
-    connect_transport_traces(transport_event_file, dst_dev);
+    connect_transport_traces(src_dev);
+    connect_transport_traces(dst_dev);
     if (snode->GetNodeType() == 0) {
       Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
       ipv4->AddInterface(d.Get(0));
@@ -927,6 +1373,12 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       }
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
       sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
+      // TC_low carries data on every configured priority group; TC_med carries
+      // trimmed packets. Queue 0 (TC_high, control) stays unbounded.
+      for (uint32_t q = 1; q < 8; q++) {
+        sw->m_mmu->ConfigEgressThreshold(q, data_queue_bytes);
+      }
+      sw->m_mmu->ConfigEgressThreshold(packet_trim_queue, trimmed_queue_bytes);
       sw->m_mmu->node_id = sw->GetId();
     }
   }
@@ -961,6 +1413,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                UintegerValue(retransmission_timeout_ns));
       rdmaHw->SetAttribute("MaxRetransmissionRetries",
                UintegerValue(max_retransmission_retries));
+      rdmaHw->SetAttribute("NoProgressTimeoutNs",
+               UintegerValue(no_progress_timeout_ns));
+      rdmaHw->SetAttribute("SelectiveRetransmission",
+               BooleanValue(selective_retransmission != 0));
       rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
       rdmaHw->SetAttribute("RateDecreaseInterval",
                            DoubleValue(rate_decrease_interval));
@@ -976,6 +1432,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("DctcpRateAI",
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetPintSmplThresh(pint_prob);
+      rdmaHw->SetAttribute("Forgiveness", BooleanValue(forgiveness));
+      rdmaHw->m_transportEventCallback =
+          MakeCallback(&record_host_transport_event);
+      if (recovery_verdict != nullptr)
+        rdmaHw->m_recoveryVerdictCallback = MakeCallback(recovery_verdict);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

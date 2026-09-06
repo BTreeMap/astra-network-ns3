@@ -25,6 +25,30 @@
 #include "ns3/int-header.h"
 
 namespace ns3 {
+
+constexpr uint8_t kUecTrimRepairProtocol = 0xFA;
+constexpr uint8_t kUecTrimNotificationProtocol = 0xFB;
+
+// UET diffserv codepoints. UEC 1.0.3 section 3.6.4.7.1 names the codepoints
+// abstractly and section 4.1 states that "this spec does not place any
+// constraints on the values of the DSCPs used"; only distinctness is
+// normative (section 4.1.4.1: DSCP_TRIMMED MUST differ from both
+// DSCP_TRIMMABLE and DSCP_CONTROL). These values realize the RECOMMENDED
+// four-codepoint / three-traffic-class mapping of section 4.1.4.1.
+constexpr uint8_t kUetDscpControl = 46;        // DSCP_CONTROL         -> TC_high
+constexpr uint8_t kUetDscpTrimmable = 8;       // DSCP_TRIMMABLE       -> TC_low
+constexpr uint8_t kUetDscpTrimmed = 16;        // DSCP_TRIMMED         -> TC_med
+constexpr uint8_t kUetDscpTrimmedLastHop = 18; // DSCP_TRIMMED_LASTHOP -> TC_med
+
+// A switch maps each DSCP_TRIMMABLE codepoint onto a DSCP_TRIMMED codepoint
+// (UEC 1.0.3 section 4.1). Only one trimmable codepoint is modeled here, so
+// the mapping is a single pair plus the optional last-hop variant.
+inline bool IsUetTrimmableDscp(uint8_t dscp){
+	return dscp == kUetDscpTrimmable;
+}
+inline bool IsUetTrimmedDscp(uint8_t dscp){
+	return dscp == kUetDscpTrimmed || dscp == kUetDscpTrimmedLastHop;
+}
 /**
  * \ingroup ipv4
  *
@@ -123,6 +147,7 @@ public:
 		  uint16_t flags;
 		  uint16_t pg;
 		  uint32_t seq; // the qbb sequence number.
+      uint32_t trim_payload_size;
 		  IntHeader ih;
 	  } ack;
 	  // PauseHeader
@@ -134,6 +159,7 @@ public:
   };
 
   uint8_t GetIpv4EcnBits (void) const;
+  uint8_t GetIpv4Dscp (void) const;
   static uint32_t GetAckSerializedSize(void);
   static uint32_t GetUdpHeaderSize(void); // include udp, seqTs, INT
   static uint32_t GetStaticWholeHeaderSize(void); // ppp + ip + udp + int

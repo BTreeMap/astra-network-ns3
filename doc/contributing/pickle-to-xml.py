@@ -25,12 +25,18 @@ def dump_pickles(out, dirname, filename, path):
     if data["prev"] is not None:
         out.write(
             '    <prev url="%s">%s</prev>\n'
-            % (os.path.normpath(os.path.join(path, data["prev"]["link"])), data["prev"]["title"])
+            % (
+                os.path.normpath(os.path.join(path, data["prev"]["link"])),
+                data["prev"]["title"],
+            )
         )
     if data["next"] is not None:
         out.write(
             '    <next url="%s">%s</next>\n'
-            % (os.path.normpath(os.path.join(path, data["next"]["link"])), data["next"]["title"])
+            % (
+                os.path.normpath(os.path.join(path, data["next"]["link"])),
+                data["next"]["title"],
+            )
         )
     out.write("  </page>\n")
 
@@ -43,5 +49,7 @@ def dump_pickles(out, dirname, filename, path):
 import sys
 
 sys.stdout.write("<pages>\n")
-dump_pickles(sys.stdout, os.path.dirname(sys.argv[1]), os.path.basename(sys.argv[1]), "/")
+dump_pickles(
+    sys.stdout, os.path.dirname(sys.argv[1]), os.path.basename(sys.argv[1]), "/"
+)
 sys.stdout.write("</pages>")

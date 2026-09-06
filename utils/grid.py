@@ -639,7 +639,9 @@ class TopLegendRenderer:
             ctx.set_source_rgb(0, 0, 0)
             ctx.set_line_width(2)
             ctx.stroke_preserve()
-            ctx.set_source_rgb(self.__colors[i].r, self.__colors[i].g, self.__colors[i].b)
+            ctx.set_source_rgb(
+                self.__colors[i].r, self.__colors[i].g, self.__colors[i].b
+            )
             ctx.fill()
             ctx.move_to(x + self.__padding * 2, total_height + t_height)
             ctx.set_source_rgb(0, 0, 0)
@@ -711,7 +713,11 @@ class TimelinesRenderer:
         @return X start
         """
         return (
-            self.padding / 2 + self.left_width + self.padding + self.right_width + self.padding / 2
+            self.padding / 2
+            + self.left_width
+            + self.padding
+            + self.right_width
+            + self.padding / 2
         )
 
     def layout(self, width):
@@ -751,8 +757,12 @@ class TimelinesRenderer:
 
         left_height = left_n_lines * max_text_height + (left_n_lines - 1) * self.padding
         right_n_lines = range_n + eventint_n + eventstr_n
-        right_height = (right_n_lines - 1) * self.padding + right_n_lines * max_text_height
-        right_data_height = (eventint_n + eventstr_n) * (max_text_height + 5) + range_n * 10
+        right_height = (
+            right_n_lines - 1
+        ) * self.padding + right_n_lines * max_text_height
+        right_data_height = (eventint_n + eventstr_n) * (
+            max_text_height + 5
+        ) + range_n * 10
         right_data_height += (right_n_lines - 1) * self.padding
 
         height = max(left_height, right_height)
@@ -864,14 +874,23 @@ class TimelinesRenderer:
         self.grey_background = 1
         for timeline in self.timelines.get_all():
             (y_bearing, t_width, t_height) = ctx.text_extents(timeline.name)[1:4]
-            ctx.move_to(left_x_start, cur_y + self.max_text_height - (t_height + y_bearing))
+            ctx.move_to(
+                left_x_start, cur_y + self.max_text_height - (t_height + y_bearing)
+            )
             ctx.show_text(timeline.name)
             for events_int in timeline.get_events_int():
                 (y_bearing, t_width, t_height) = ctx.text_extents(events_int.name)[1:4]
-                ctx.move_to(right_x_start, cur_y + self.max_text_height - (t_height + y_bearing))
+                ctx.move_to(
+                    right_x_start, cur_y + self.max_text_height - (t_height + y_bearing)
+                )
                 ctx.show_text(events_int.name)
                 self.draw_events(
-                    ctx, events_int, data_x_start, cur_y, data_width, self.max_text_height + 5
+                    ctx,
+                    events_int,
+                    data_x_start,
+                    cur_y,
+                    data_width,
+                    self.max_text_height + 5,
                 )
                 cur_y += self.max_text_height + 5 + self.padding
                 self.draw_line(
@@ -884,10 +903,17 @@ class TimelinesRenderer:
 
             for events_str in timeline.get_events_str():
                 (y_bearing, t_width, t_height) = ctx.text_extents(events_str.name)[1:4]
-                ctx.move_to(right_x_start, cur_y + self.max_text_height - (t_height + y_bearing))
+                ctx.move_to(
+                    right_x_start, cur_y + self.max_text_height - (t_height + y_bearing)
+                )
                 ctx.show_text(events_str.name)
                 self.draw_events(
-                    ctx, events_str, data_x_start, cur_y, data_width, self.max_text_height + 5
+                    ctx,
+                    events_str,
+                    data_x_start,
+                    cur_y,
+                    data_width,
+                    self.max_text_height + 5,
                 )
                 cur_y += self.max_text_height + 5 + self.padding
                 self.draw_line(
@@ -899,7 +925,9 @@ class TimelinesRenderer:
                 )
             for ranges in timeline.get_ranges():
                 (y_bearing, t_width, t_height) = ctx.text_extents(ranges.name)[1:4]
-                ctx.move_to(right_x_start, cur_y + self.max_text_height - (t_height + y_bearing))
+                ctx.move_to(
+                    right_x_start, cur_y + self.max_text_height - (t_height + y_bearing)
+                )
                 ctx.show_text(ranges.name)
                 self.draw_ranges(ctx, ranges, data_x_start, cur_y, data_width, 10)
                 cur_y += self.max_text_height + self.padding
@@ -1260,12 +1288,16 @@ class GraphicRenderer:
         ctx.save()
         ctx.translate(
             self.__data.get_data_x_start(),
-            top_legend_height + self.__data.get_height() + self.__mid_scale.get_height(),
+            top_legend_height
+            + self.__data.get_height()
+            + self.__mid_scale.get_height(),
         )
         self.__mid_scale.draw(ctx)
         ctx.restore()
 
-        height_used = top_legend_height + self.__data.get_height() + self.__mid_scale.get_height()
+        height_used = (
+            top_legend_height + self.__data.get_height() + self.__mid_scale.get_height()
+        )
 
         # separation between scale and left pane
         ctx.move_to(self.__data.get_data_x_start(), height_used)
@@ -1507,7 +1539,9 @@ class GtkGraphicRenderer(gtk.DrawingArea):
             return True
         if self.__moving_both:
             self.__moving_both = False
-            delta = self.__data.scale_selection(self.__moving_both_cur - self.__moving_both_start)
+            delta = self.__data.scale_selection(
+                self.__moving_both_cur - self.__moving_both_start
+            )
             (left, right) = self.__data.get_range()
             self.__data.set_range(left + delta, right + delta)
             self.__force_full_redraw = True
@@ -1556,7 +1590,9 @@ class GtkGraphicRenderer(gtk.DrawingArea):
             return True
         if self.__moving_top:
             self.__moving_top_cur = event.x
-            delta = self.__data.scale_data(self.__moving_top_start - self.__moving_top_cur)
+            delta = self.__data.scale_data(
+                self.__moving_top_start - self.__moving_top_cur
+            )
             (left, right) = self.__data.get_range()
             self.__data.set_range(left + delta, right + delta)
             self.__force_full_redraw = True
@@ -1742,7 +1778,9 @@ def read_data(filename):
     m1 = re.compile("range ([^ ]+) ([^ ]+) ([^ ]+) ([0-9]+) ([0-9]+)")
     m2 = re.compile("event-str ([^ ]+) ([^ ]+) ([^ ]+) ([0-9]+)")
     m3 = re.compile("event-int ([^ ]+) ([^ ]+) ([0-9]+) ([0-9]+)")
-    m4 = re.compile("color ([^ ]+) #([a-fA-F0-9]{2,2})([a-fA-F0-9]{2,2})([a-fA-F0-9]{2,2})")
+    m4 = re.compile(
+        "color ([^ ]+) #([a-fA-F0-9]{2,2})([a-fA-F0-9]{2,2})([a-fA-F0-9]{2,2})"
+    )
 
     with open(filename, encoding="utf-8") as fh:
         for line in fh.readlines():

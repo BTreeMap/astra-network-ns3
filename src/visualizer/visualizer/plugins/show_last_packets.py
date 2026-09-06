@@ -143,11 +143,19 @@ class ShowLastPackets(InformationWindow):
         def smart_expand(expander, vbox):
             if expander.get_expanded():
                 vbox.set_child_packing(
-                    expander, expand=True, fill=True, padding=0, pack_type=Gtk.PACK_START
+                    expander,
+                    expand=True,
+                    fill=True,
+                    padding=0,
+                    pack_type=Gtk.PACK_START,
                 )
             else:
                 vbox.set_child_packing(
-                    expander, expand=False, fill=False, padding=0, pack_type=Gtk.PACK_START
+                    expander,
+                    expand=False,
+                    fill=False,
+                    padding=0,
+                    pack_type=Gtk.PACK_START,
                 )
 
         main_hbox = Gtk.HBox(False, 4)
@@ -242,9 +250,13 @@ class ShowLastPackets(InformationWindow):
 
         def update_capture_options():
             if self.op_AND_button.props.active:
-                self.packet_capture_options.mode = ns.PyViz.PACKET_CAPTURE_FILTER_HEADERS_AND
+                self.packet_capture_options.mode = (
+                    ns.PyViz.PACKET_CAPTURE_FILTER_HEADERS_AND
+                )
             else:
-                self.packet_capture_options.mode = ns.PyViz.PACKET_CAPTURE_FILTER_HEADERS_OR
+                self.packet_capture_options.mode = (
+                    ns.PyViz.PACKET_CAPTURE_FILTER_HEADERS_OR
+                )
             self.packet_capture_options.numLastPackets = 100
             self.packet_capture_options.headers = [
                 c.typeid for c in self.packet_filter_list if c.selected
@@ -313,7 +325,9 @@ class ShowLastPackets(InformationWindow):
         @param self this object
         @return none
         """
-        last_packets = self.visualizer.simulation.sim_helper.GetLastPackets(self.node.GetId())
+        last_packets = self.visualizer.simulation.sim_helper.GetLastPackets(
+            self.node.GetId()
+        )
 
         self.tx_list.update(self.node, last_packets.lastTransmittedPackets)
         self.rx_list.update(self.node, last_packets.lastReceivedPackets)

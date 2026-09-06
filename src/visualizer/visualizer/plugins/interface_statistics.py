@@ -258,4 +258,6 @@ def populate_node_menu(viz, node, menu, statistics_collector):
 def register(viz):
     statistics_collector = StatisticsCollector(viz)
     viz.connect("populate-node-menu", populate_node_menu, statistics_collector)
-    viz.connect("simulation-periodic-update", statistics_collector.simulation_periodic_update)
+    viz.connect(
+        "simulation-periodic-update", statistics_collector.simulation_periodic_update
+    )

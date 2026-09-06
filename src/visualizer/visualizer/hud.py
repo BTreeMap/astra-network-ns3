@@ -151,7 +151,8 @@ class Axes(object):
 
         x1, y1 = self.viz.canvas.convert_from_pixels(hadj.get_value(), vadj.get_value())
         x2, y2 = self.viz.canvas.convert_from_pixels(
-            hadj.get_value() + hadj.get_page_size(), vadj.get_value() + vadj.get_page_size()
+            hadj.get_value() + hadj.get_page_size(),
+            vadj.get_value() + vadj.get_page_size(),
         )
         line_width = 5.0 / self.viz.zoom.get_value()
 
@@ -166,7 +167,8 @@ class Axes(object):
         x = x0
         while x < sim_x2:
             path.append(
-                "M %r %r L %r %r" % (PIXELS_PER_METER * x, yc - offset, PIXELS_PER_METER * x, yc)
+                "M %r %r L %r %r"
+                % (PIXELS_PER_METER * x, yc - offset, PIXELS_PER_METER * x, yc)
             )
             label = get_label()
             label.set_properties(
@@ -195,7 +197,8 @@ class Axes(object):
         y = y0
         while y < sim_y2:
             path.append(
-                "M %r %r L %r %r" % (xc, PIXELS_PER_METER * y, xc + offset, PIXELS_PER_METER * y)
+                "M %r %r L %r %r"
+                % (xc, PIXELS_PER_METER * y, xc + offset, PIXELS_PER_METER * y)
             )
             label = get_label()
             label.set_properties(

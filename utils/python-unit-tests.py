@@ -228,11 +228,17 @@ class TestSimulator(unittest.TestCase):
         """
         )
 
-        sink = ns.Socket.CreateSocket(node, ns.TypeId.LookupByName("ns3::UdpSocketFactory"))
+        sink = ns.Socket.CreateSocket(
+            node, ns.TypeId.LookupByName("ns3::UdpSocketFactory")
+        )
         sink.Bind(ns.InetSocketAddress(ns.Ipv4Address.GetAny(), 80).ConvertTo())
-        sink.SetRecvCallback(ns.cppyy.gbl.make_rx_callback_test_socket(python_rx_callback))
+        sink.SetRecvCallback(
+            ns.cppyy.gbl.make_rx_callback_test_socket(python_rx_callback)
+        )
 
-        source = ns.Socket.CreateSocket(node, ns.TypeId.LookupByName("ns3::UdpSocketFactory"))
+        source = ns.Socket.CreateSocket(
+            node, ns.TypeId.LookupByName("ns3::UdpSocketFactory")
+        )
         source.SendTo(
             ns.Packet(19),
             0,
@@ -411,7 +417,9 @@ class TestSimulator(unittest.TestCase):
                 """
                 super().__init__()
                 ## __python_owns__ flag indicates that Cppyy should not manage the lifetime of this variable
-                self.__python_owns__ = False  # Let C++ destroy this on Simulator::Destroy
+                self.__python_owns__ = (
+                    False  # Let C++ destroy this on Simulator::Destroy
+                )
                 ## Listen port for the server
                 self.port = port
                 ## Socket used by the server to listen to port
@@ -471,7 +479,9 @@ class TestSimulator(unittest.TestCase):
                         file=sys.stderr,
                         flush=True,
                     )
-                event = ns.pythonMakeEventSend(EchoServer._Send, self.m_socket, packet, address)
+                event = ns.pythonMakeEventSend(
+                    EchoServer._Send, self.m_socket, packet, address
+                )
                 ns.Simulator.Schedule(ns.Seconds(1), event)
 
             @staticmethod

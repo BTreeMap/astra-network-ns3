@@ -54,7 +54,9 @@ def main(argv):
     batteryModel.SetAttribute("ExponentialCapacity", ns.DoubleValue(1.3))  # Qexp
 
     batteryModel.SetAttribute("InternalResistance", ns.DoubleValue(0.0046))  # R
-    batteryModel.SetAttribute("TypicalDischargeCurrent", ns.DoubleValue(1.3))  # i typical
+    batteryModel.SetAttribute(
+        "TypicalDischargeCurrent", ns.DoubleValue(1.3)
+    )  # i typical
     batteryModel.SetAttribute("CutoffVoltage", ns.DoubleValue(1.0))  # End of charge.
 
     batteryModel.SetAttribute(

@@ -28,7 +28,13 @@ class FiveTuple(object):
     #  destination port
     ## @var __slots_
     #  class variable list
-    __slots_ = ["sourceAddress", "destinationAddress", "protocol", "sourcePort", "destinationPort"]
+    __slots_ = [
+        "sourceAddress",
+        "destinationAddress",
+        "protocol",
+        "sourcePort",
+        "destinationPort",
+    ]
 
     def __init__(self, el):
         """! The initializer.
@@ -61,7 +67,11 @@ class Histogram(object):
             # self.nbins = int(el.get('nBins'))
             for bin in el.findall("bin"):
                 self.bins.append(
-                    (float(bin.get("start")), float(bin.get("width")), int(bin.get("count")))
+                    (
+                        float(bin.get("start")),
+                        float(bin.get("width")),
+                        int(bin.get("count")),
+                    )
                 )
 
 

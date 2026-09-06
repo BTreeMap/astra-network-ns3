@@ -6,6 +6,7 @@
 #include <ns3/simulator.h>
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
+#include <algorithm>
 
 namespace ns3 {
 
@@ -35,8 +36,21 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_highest_sent = 0;
 	m_data_attempted_bytes = 0;
 	m_retransmitted_bytes = 0;
+	m_trimmed_payload_bytes = 0;
 	m_recovery_events = 0;
-	m_timeout_retries = 0;
+	m_trim_notifications = 0;
+	m_trim_ftd_repairs = 0;
+	m_trim_bts_notifications = 0;
+	m_trim_lasthop_notifications = 0;
+	m_trim_recovery_events = 0;
+	m_stale_trim_notifications = 0;
+	m_recovery_retries = 0;
+	m_timeouts = 0;
+	m_cnp_received = 0;
+	m_priority_pulls = 0;
+	m_first_trim_ns = 0;
+	m_first_repair_ns = 0;
+	m_last_progress_ns = Simulator::Now().GetNanoSeconds();
 	m_failure_reason = 0;
 	m_failed = false;
 	m_pg = pg;
@@ -137,7 +151,85 @@ void RdmaQueuePair::SetAppSentCallback(Callback<void> notifyAppSent){
 
 
 uint64_t RdmaQueuePair::GetBytesLeft(){
-	return m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	// Pending selective repairs count as sendable bytes: a queue pair whose
+	// tail is fully transmitted must stay schedulable until its repair
+	// ranges have been resent. This runs inside the egress queue's per-packet
+	// scan over every registered queue pair, so the overwhelmingly common
+	// no-repairs case must stay one comparison — RepairBytesLeft() walks and
+	// prunes the range map and is only entered when ranges exist, which
+	// requires selective retransmission to be enabled and active.
+	uint64_t tail = m_size >= snd_nxt ? m_size - snd_nxt : 0;
+	if (m_repair_ranges.empty())
+		return tail;
+	return tail + RepairBytesLeft();
+}
+
+void RdmaQueuePair::AddRepairRange(uint64_t start, uint64_t end){
+	if (start < snd_una)
+		start = snd_una;
+	if (end > m_size)
+		end = m_size;
+	if (start >= end)
+		return;
+	// Merge with any overlapping or adjacent recorded ranges.
+	auto it = m_repair_ranges.lower_bound(start);
+	if (it != m_repair_ranges.begin()){
+		auto prev = std::prev(it);
+		if (prev->second >= start){
+			start = prev->first;
+			if (prev->second > end)
+				end = prev->second;
+			m_repair_ranges.erase(prev);
+		}
+	}
+	it = m_repair_ranges.lower_bound(start);
+	while (it != m_repair_ranges.end() && it->first <= end){
+		if (it->second > end)
+			end = it->second;
+		it = m_repair_ranges.erase(it);
+	}
+	m_repair_ranges[start] = end;
+}
+
+uint64_t RdmaQueuePair::TakeRepairSegment(uint64_t max_bytes, uint64_t &start){
+	DropAcknowledgedRepairs();
+	if (m_repair_ranges.empty() || max_bytes == 0)
+		return 0;
+	auto it = m_repair_ranges.begin();
+	start = it->first;
+	uint64_t size = it->second - it->first;
+	if (size > max_bytes)
+		size = max_bytes;
+	uint64_t new_start = start + size;
+	uint64_t end = it->second;
+	m_repair_ranges.erase(it);
+	if (new_start < end)
+		m_repair_ranges[new_start] = end;
+	return size;
+}
+
+void RdmaQueuePair::DropAcknowledgedRepairs(){
+	while (!m_repair_ranges.empty()){
+		auto it = m_repair_ranges.begin();
+		if (it->second <= snd_una){
+			m_repair_ranges.erase(it);
+			continue;
+		}
+		if (it->first < snd_una){
+			uint64_t end = it->second;
+			m_repair_ranges.erase(it);
+			m_repair_ranges[snd_una] = end;
+		}
+		break;
+	}
+}
+
+uint64_t RdmaQueuePair::RepairBytesLeft(){
+	DropAcknowledgedRepairs();
+	uint64_t total = 0;
+	for (auto const &range : m_repair_ranges)
+		total += range.second - range.first;
+	return total;
 }
 
 uint32_t RdmaQueuePair::GetHash(void){
@@ -158,6 +250,13 @@ uint32_t RdmaQueuePair::GetHash(void){
 void RdmaQueuePair::Acknowledge(uint64_t ack){
 	if (ack > snd_una){
 		snd_una = ack;
+		// A cumulative ACK can outrun a go-back-N rewind: resent duplicates
+		// make the receiver repeat its frontier ACK, which lands above the
+		// rewound snd_nxt. Unclamped, GetOnTheFly() underflows and the window
+		// check blocks the queue pair from ever sending again.
+		if (snd_nxt < snd_una){
+			snd_nxt = snd_una;
+		}
 	}
 }
 
@@ -239,6 +338,94 @@ uint32_t RdmaRxQueuePair::GetHash(void){
 	buf.sport = sport;
 	buf.dport = dport;
 	return Hash32(buf.c, 12);
+}
+
+void RdmaRxQueuePair::AddOutOfOrderRange(uint64_t start, uint64_t end){
+	if (start >= end)
+		return;
+	auto it = m_ooo_ranges.lower_bound(start);
+	if (it != m_ooo_ranges.begin()){
+		auto prev = std::prev(it);
+		if (prev->second >= start){
+			start = prev->first;
+			if (prev->second > end)
+				end = prev->second;
+			m_ooo_ranges.erase(prev);
+		}
+	}
+	it = m_ooo_ranges.lower_bound(start);
+	while (it != m_ooo_ranges.end() && it->first <= end){
+		if (it->second > end)
+			end = it->second;
+		it = m_ooo_ranges.erase(it);
+	}
+	m_ooo_ranges[start] = end;
+}
+
+uint64_t RdmaRxQueuePair::AbsorbContiguousFrom(uint64_t expected){
+	auto it = m_ooo_ranges.begin();
+	while (it != m_ooo_ranges.end() && it->first <= expected){
+		if (it->second > expected)
+			expected = it->second;
+		it = m_ooo_ranges.erase(it);
+	}
+	return expected;
+}
+
+uint64_t RdmaRxQueuePair::UnsettledBytes(uint64_t start, uint64_t end) const{
+	// Clip below: everything under the cumulative sequence is delivered, so a
+	// trim straddling it names fewer new bytes than its length.
+	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
+	if (start < expected)
+		start = expected;
+	if (start >= end)
+		return 0;
+	uint64_t unsettled = end - start;
+	// AddOutOfOrderRange merges every overlapping and touching range, so the
+	// entries are disjoint and no byte is subtracted twice. The scan starts at
+	// the last entry beginning at or below start, the only one that can reach
+	// into the range from the left.
+	auto it = m_ooo_ranges.upper_bound(start);
+	if (it != m_ooo_ranges.begin())
+		--it;
+	for (; it != m_ooo_ranges.end() && it->first < end; ++it){
+		const uint64_t overlap_start = std::max(it->first, start);
+		const uint64_t overlap_end = std::min(it->second, end);
+		if (overlap_end > overlap_start)
+			unsettled -= overlap_end - overlap_start;
+	}
+	return unsettled;
+}
+
+const RdmaRxQueuePair::PulledRange* RdmaRxQueuePair::FindPulledRange(
+		uint64_t offset) const{
+	if (m_pulled_ranges.empty())
+		return nullptr;
+	auto it = m_pulled_ranges.upper_bound(offset);
+	if (it == m_pulled_ranges.begin())
+		return nullptr;
+	--it;
+	return it->second.end > offset ? &it->second : nullptr;
+}
+
+void RdmaRxQueuePair::RecordPulledRange(uint64_t start, uint64_t end,
+		bool priority){
+	m_pulled_ranges[start] = PulledRange{end, priority};
+}
+
+void RdmaRxQueuePair::PruneSettledPulls(){
+	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
+	// An entry starting at or above the cumulative sequence ends above it, so
+	// the scan stops there. Below it every settled entry is erased, including
+	// one sitting behind an entry that still straddles the frontier; a
+	// front-only pop would leave those in place forever.
+	const auto limit = m_pulled_ranges.lower_bound(expected);
+	for (auto it = m_pulled_ranges.begin(); it != limit; ){
+		if (it->second.end <= expected)
+			it = m_pulled_ranges.erase(it);
+		else
+			++it;
+	}
 }
 
 /*********************

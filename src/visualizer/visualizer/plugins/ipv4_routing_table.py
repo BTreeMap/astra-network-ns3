@@ -60,7 +60,8 @@ class ShowIpv4RoutingTable(InformationWindow):
         treeview.show()
         sw = Gtk.ScrolledWindow()
         sw.set_properties(
-            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
         )
         sw.show()
         sw.add(treeview)
@@ -74,19 +75,27 @@ class ShowIpv4RoutingTable(InformationWindow):
         treeview.append_column(column)
 
         # Next hop
-        column = Gtk.TreeViewColumn("Next hop", Gtk.CellRendererText(), text=self.COLUMN_NEXT_HOP)
+        column = Gtk.TreeViewColumn(
+            "Next hop", Gtk.CellRendererText(), text=self.COLUMN_NEXT_HOP
+        )
         treeview.append_column(column)
 
         # Interface
-        column = Gtk.TreeViewColumn("Interface", Gtk.CellRendererText(), text=self.COLUMN_INTERFACE)
+        column = Gtk.TreeViewColumn(
+            "Interface", Gtk.CellRendererText(), text=self.COLUMN_INTERFACE
+        )
         treeview.append_column(column)
 
         # Type
-        column = Gtk.TreeViewColumn("Type", Gtk.CellRendererText(), text=self.COLUMN_TYPE)
+        column = Gtk.TreeViewColumn(
+            "Type", Gtk.CellRendererText(), text=self.COLUMN_TYPE
+        )
         treeview.append_column(column)
 
         # Prio
-        column = Gtk.TreeViewColumn("Prio", Gtk.CellRendererText(), text=self.COLUMN_PRIO)
+        column = Gtk.TreeViewColumn(
+            "Prio", Gtk.CellRendererText(), text=self.COLUMN_PRIO
+        )
         treeview.append_column(column)
 
         self.visualizer.add_information_window(self)
