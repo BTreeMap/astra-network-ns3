@@ -91,6 +91,16 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_forgiveness),
 				MakeBooleanChecker())
+		.AddAttribute("CongestionExemption",
+				"Ask the congestion-exemption callback, once per queue pair, "
+				"whether that queue pair may ignore every congestion signal "
+				"until the receiver refuses to forgive one of its trims. Off "
+				"leaves every queue pair obeying congestion control. Requires "
+				"Forgiveness: refusal is what ends the exemption, and a "
+				"transport that never forgives never refuses.",
+				BooleanValue(false),
+				MakeBooleanAccessor(&RdmaHw::m_congestionExemption),
+				MakeBooleanChecker())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -233,6 +243,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"Forgiveness needs SelectiveRetransmission: under go-back-N the "
 		"receiver never consults its out-of-order ranges, so a forgiven range "
 		"would be pulled forever");
+	NS_ABORT_MSG_IF(m_congestionExemption && !m_forgiveness,
+		"CongestionExemption needs Forgiveness: the receiver's refusal to "
+		"forgive is the only signal that ends an exemption, so without "
+		"forgiveness an exempt queue pair would never take a rate cut again");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -282,6 +296,12 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
 	qp->SetAppSentCallback(notifyAppSent);
+	// Congestion response is decided once, at birth. The experiment layer owns
+	// eligibility, the step and the budget; the transport supplies a five-tuple
+	// and stores the answer.
+	qp->m_cc_exempt = m_congestionExemption &&
+		!m_congestionExemptionCallback.IsNull() &&
+		m_congestionExemptionCallback(sip.Get(), dip.Get(), sport, dport);
 	// add qp
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].qpGrp->AddQp(qp);
@@ -626,6 +646,16 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 
 void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		const CustomHeader &ch, bool isFtdRepair){
+	if (qp->m_cc_exempt){
+		// A PULL is the receiver refusing to forgive, and refusal is the only
+		// visible edge of a budget shared across every sender to that rank. It
+		// ends the exemption before the stale check, because a stale PULL is
+		// still a refusal, and before the rate cut below, so this trim's own
+		// CNP is taken.
+		qp->m_cc_exempt = false;
+		qp->m_cc_rearmed_ns = Simulator::Now().GetNanoSeconds();
+		ReportTransportEvent("cc_rearmed", 0);
+	}
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
@@ -1147,6 +1177,16 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q){
 }
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
+	if (q->m_cc_exempt){
+		// The exemption covers every congestion signal the sender would take,
+		// not only the trim-originated ones: ECN marks start far below the
+		// queue depth that trims, so leaving them in place would keep most of
+		// the rate cuts and move nothing. Bounded loss pays for the congestion
+		// instead, and the receiver's first refusal to forgive ends this.
+		q->m_cnp_ignored++;
+		ReportTransportEvent("cnp_ignored", 0);
+		return;
+	}
 	q->m_cnp_received++;
 	ReportTransportEvent("cnp_taken", 0);
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update

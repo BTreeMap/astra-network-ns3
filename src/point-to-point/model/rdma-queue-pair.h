@@ -42,6 +42,16 @@ public:
 	uint32_t m_cnp_received;
 	// Priority pulls the sender served. Recovery domain only.
 	uint32_t m_priority_pulls;
+	// Congestion response as a two-variant sum {obey, exempt}. A bool carries
+	// it because the transition is one-way and the value is read on the CNP
+	// path: set once at birth from the experiment layer's answer, cleared once
+	// by the first PULL, which is the receiver refusing to forgive. An exempt
+	// queue pair pays for congestion in bounded loss instead of rate.
+	bool m_cc_exempt;
+	// CNPs discarded while exempt, and the simulated time the exemption ended.
+	// Zero means it never did: no PULL can arrive before the first send.
+	uint32_t m_cnp_ignored;
+	uint64_t m_cc_rearmed_ns;
 	// Simulated times of the first trim notification received and the first
 	// repair packet sent. Zero means never: no packet can be trimmed or
 	// repaired before the transfer's first send.

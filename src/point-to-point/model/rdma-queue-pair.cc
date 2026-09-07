@@ -48,6 +48,9 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_timeouts = 0;
 	m_cnp_received = 0;
 	m_priority_pulls = 0;
+	m_cc_exempt = false;
+	m_cnp_ignored = 0;
+	m_cc_rearmed_ns = 0;
 	m_first_trim_ns = 0;
 	m_first_repair_ns = 0;
 	m_last_progress_ns = Simulator::Now().GetNanoSeconds();

@@ -1139,14 +1139,19 @@ void SetConfig() {
 }
 
 // `recovery_verdict` is the experiment layer's answer to "what do I do with
-// this trimmed range": the transport asks, it never decides. A null callback
-// and `forgiveness` false leave the pull-everything transport untouched.
+// this trimmed range" and `congestion_exemption` its answer to "may this queue
+// pair ignore congestion": the transport asks, it never decides. Null callbacks
+// with `forgiveness` and `congestion_exempt` false leave the pull-everything,
+// congestion-obeying transport untouched.
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
                   uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
                                               uint16_t, uint64_t,
                                               uint32_t) = nullptr,
-                  bool forgiveness = false) {
+                  bool forgiveness = false,
+                  bool (*congestion_exemption)(uint32_t, uint32_t, uint16_t,
+                                               uint16_t) = nullptr,
+                  bool congestion_exempt = false) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1433,10 +1438,15 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetPintSmplThresh(pint_prob);
       rdmaHw->SetAttribute("Forgiveness", BooleanValue(forgiveness));
+      rdmaHw->SetAttribute("CongestionExemption",
+                           BooleanValue(congestion_exempt));
       rdmaHw->m_transportEventCallback =
           MakeCallback(&record_host_transport_event);
       if (recovery_verdict != nullptr)
         rdmaHw->m_recoveryVerdictCallback = MakeCallback(recovery_verdict);
+      if (congestion_exemption != nullptr)
+        rdmaHw->m_congestionExemptionCallback =
+            MakeCallback(congestion_exemption);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

@@ -54,6 +54,10 @@ public:
 	// step, and the budget. Requires selective retransmission, because a
 	// forgiven range is absorbed as an accepted out-of-order range.
 	bool m_forgiveness;
+	// Congestion-exempt forgiveness. A queue pair the exemption callback
+	// answers for takes no rate cut until the receiver refuses to forgive one
+	// of its trims. The transport asks once, at birth, and never learns why.
+	bool m_congestionExemption;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -88,6 +92,12 @@ public:
 	typedef Callback<uint8_t, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
 		uint32_t> RecoveryVerdictCallback;
 	RecoveryVerdictCallback m_recoveryVerdictCallback;
+	// (sip, dip, sport, dport) -> may this queue pair ignore congestion
+	// signals. Unset means no, which is the behaviour of a transport with no
+	// exemption at all.
+	typedef Callback<bool, uint32_t, uint32_t, uint16_t, uint16_t>
+		CongestionExemptionCallback;
+	CongestionExemptionCallback m_congestionExemptionCallback;
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice
