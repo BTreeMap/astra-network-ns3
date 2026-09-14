@@ -27,8 +27,6 @@ public:
 	uint64_t m_trimmed_payload_bytes;
 	uint32_t m_recovery_events;
 	uint32_t m_trim_notifications;
-	uint32_t m_trim_ftd_repairs;
-	uint32_t m_trim_bts_notifications;
 	uint32_t m_trim_lasthop_notifications;
 	uint32_t m_trim_recovery_events;
 	uint32_t m_stale_trim_notifications;
@@ -40,17 +38,18 @@ public:
 	// Rate cuts taken. Only CC mode 1 (DCQCN) reacts, so this is zero in every
 	// other mode and separates a CC-driven tail from a repair-driven one.
 	uint32_t m_cnp_received;
-	// Priority pulls the sender served. Recovery domain only.
-	uint32_t m_priority_pulls;
 	// Congestion response as a two-variant sum {obey, exempt}. A bool carries
-	// it because the transition is one-way and the value is read on the CNP
-	// path: set once at birth from the experiment layer's answer, cleared once
-	// by the first PULL, which is the receiver refusing to forgive. An exempt
-	// queue pair pays for congestion in bounded loss instead of rate.
+	// it because the transition is one-way and the value is read on the
+	// congestion path: set once at birth from the experiment layer's answer,
+	// cleared once by the receiver's report that the budget entry is spent. An
+	// exempt queue pair pays for congestion in bounded loss instead of rate.
 	bool m_cc_exempt;
-	// CNPs discarded while exempt, and the simulated time the exemption ended.
-	// Zero means it never did: no PULL can arrive before the first send.
-	uint32_t m_cnp_ignored;
+	// Congestion signals withheld from the controller while exempt, reports
+	// that the entry had no allowance left, and the simulated time the
+	// exemption ended. Zero time means it never did: no report can arrive
+	// before the first send.
+	uint32_t m_cc_signals_withheld;
+	uint32_t m_allowance_spent_signalled;
 	uint64_t m_cc_rearmed_ns;
 	// Simulated times of the first trim notification received and the first
 	// repair packet sent. Zero means never: no packet can be trimmed or
@@ -180,18 +179,6 @@ public:
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	// Out-of-order payload ranges accepted under selective retransmission.
 	std::map<uint64_t, uint64_t> m_ooo_ranges;
-	// Recovery-domain forgiveness state.
-	struct PulledRange {
-		uint64_t end;
-		// The PULL already sent for this range. A repeated trim must repeat
-		// the same request, or one range could be pulled at two priorities.
-		bool priority;
-	};
-	// Trimmed ranges with a PULL outstanding, keyed by start. A repair
-	// re-segmenter can chop a merged range at a boundary no trim used, so
-	// entries are not assumed packet-aligned with the trims that arrive.
-	std::map<uint64_t, PulledRange> m_pulled_ranges;
-
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);
@@ -203,14 +190,6 @@ public:
 	// absorb, so a ledger charged this figure charges what it takes. Zero
 	// means the range is settled and the trim is a duplicate.
 	uint64_t UnsettledBytes(uint64_t start, uint64_t end) const;
-	// The outstanding PULL covering an offset, or nullptr when none is. The
-	// offset need not be the recorded start: a re-segmented repair can trim a
-	// range that begins inside one already pulled.
-	const PulledRange* FindPulledRange(uint64_t offset) const;
-	void RecordPulledRange(uint64_t start, uint64_t end, bool priority);
-	// Drop every pulled range the cumulative sequence has passed. Callers
-	// must check emptiness first: this runs on the receive path.
-	void PruneSettledPulls();
 };
 
 class RdmaQueuePairGroup : public Object {

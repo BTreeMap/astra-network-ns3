@@ -264,7 +264,6 @@ bool SwitchNode::SendTrimNotification(Ptr<const Packet> original,
 	trimHeader.SetSport(ch.udp.dport);
 	trimHeader.SetDport(ch.udp.sport);
 	trimHeader.SetTrimPayloadSize(payloadSize);
-	trimHeader.SetTrimFtd(false);
 	trimHeader.SetTrimLastHop(lastHop);
 	trimHeader.SetIntHeader(ch.udp.ih);
 

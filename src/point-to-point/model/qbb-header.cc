@@ -52,23 +52,17 @@ namespace ns3 {
 	void qbbHeader::SetTrimPayloadSize(uint32_t payloadSize){
 		m_trimPayloadSize = payloadSize;
 	}
-	void qbbHeader::SetTrimFtd(bool forwardToDestination){
-		if (forwardToDestination)
-			flags |= 1 << FLAG_TRIM_FTD;
-		else
-			flags &= ~(1 << FLAG_TRIM_FTD);
-	}
 	void qbbHeader::SetTrimLastHop(bool lastHop){
 		if (lastHop)
 			flags |= 1 << FLAG_TRIM_LASTHOP;
 		else
 			flags &= ~(1 << FLAG_TRIM_LASTHOP);
 	}
-	void qbbHeader::SetPullPriority(bool priority){
-		if (priority)
-			flags |= 1 << FLAG_PULL_PRIORITY;
+	void qbbHeader::SetAllowanceExhausted(bool spent){
+		if (spent)
+			flags |= 1 << FLAG_ALLOWANCE_EXHAUSTED;
 		else
-			flags &= ~(1 << FLAG_PULL_PRIORITY);
+			flags &= ~(1 << FLAG_ALLOWANCE_EXHAUSTED);
 	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
@@ -101,14 +95,11 @@ namespace ns3 {
 	uint32_t qbbHeader::GetTrimPayloadSize() const{
 		return m_trimPayloadSize;
 	}
-	bool qbbHeader::IsTrimFtd() const{
-		return (flags >> FLAG_TRIM_FTD) & 1;
-	}
 	bool qbbHeader::IsTrimLastHop() const{
 		return (flags >> FLAG_TRIM_LASTHOP) & 1;
 	}
-	bool qbbHeader::IsPullPriority() const{
-		return (flags >> FLAG_PULL_PRIORITY) & 1;
+	bool qbbHeader::IsAllowanceExhausted() const{
+		return (flags >> FLAG_ALLOWANCE_EXHAUSTED) & 1;
 	}
 
 	TypeId

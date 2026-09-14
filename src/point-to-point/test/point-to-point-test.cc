@@ -171,7 +171,6 @@ class UecTrimHeaderTest : public TestCase
         trim.SetSport(10000);
         trim.SetDport(10001);
         trim.SetTrimPayloadSize(1000);
-        trim.SetTrimFtd(true);
         trim.SetTs(123456789);
 
         Ptr<Packet> packet = Create<Packet>(0);
@@ -200,9 +199,6 @@ class UecTrimHeaderTest : public TestCase
                               "trim preserves the missing byte sequence");
         NS_TEST_EXPECT_MSG_EQ(parsed.ack.trim_payload_size, 1000,
                               "trim preserves the missing payload size");
-        NS_TEST_EXPECT_MSG_EQ(
-            ((parsed.ack.flags >> qbbHeader::FLAG_TRIM_FTD) & 1), 1,
-            "trim preserves its forward-to-destination direction");
 
         CustomHeader serialized(CustomHeader::L3_Header | CustomHeader::L4_Header);
         serialized.m_tos = 0;
@@ -500,16 +496,16 @@ class UecTrimRecoveryTest : public TestCase
         trim.ack.seq = 0;
         trim.ack.trim_payload_size = kTrimmedBytes;
 
-        senderHw->RecoverTrimmedQueue(senderQp, trim, false);
+        senderHw->RecoverTrimmedQueue(senderQp, trim);
         NS_TEST_EXPECT_MSG_EQ(senderQp->snd_nxt,
                               0,
-                              "BTS trim must restart from the last cumulative ACK");
+                              "a trim must restart from the last cumulative ACK");
         NS_TEST_EXPECT_MSG_EQ(senderQp->m_trimmed_payload_bytes,
                               kTrimmedBytes,
-                              "BTS trim must account for missing payload bytes");
-        NS_TEST_EXPECT_MSG_EQ(senderQp->m_trim_bts_notifications,
+                              "a trim must account for missing payload bytes");
+        NS_TEST_EXPECT_MSG_EQ(senderQp->m_trim_notifications,
                               1,
-                              "BTS trim must be distinguishable from FTD repair");
+                              "an actionable trim must be counted");
         NS_TEST_EXPECT_MSG_EQ(senderQp->m_recovery_retries,
                               1,
                               "an actionable trim must consume the bounded recovery budget");
@@ -528,7 +524,7 @@ class UecTrimRecoveryTest : public TestCase
                               0,
                               "cumulative ACK progress must reset the recovery budget");
 
-        senderHw->RecoverTrimmedQueue(senderQp, trim, false);
+        senderHw->RecoverTrimmedQueue(senderQp, trim);
         NS_TEST_EXPECT_MSG_EQ(senderQp->m_stale_trim_notifications,
                               1,
                               "trim ranges covered by a cumulative ACK must be stale");

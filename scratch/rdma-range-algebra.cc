@@ -1,6 +1,6 @@
 // Self-checking fixture for the receive-side range algebra that the recovery
-// domain charges its budget from. Exits 0 when every law holds and 1 with the
-// failing law on stderr otherwise.
+// domain charges its budget from, and for the sender's congestion exemption.
+// Exits 0 when every law holds and 1 with the failing law on stderr otherwise.
 //
 // A fabric run cannot reach these branches. The sender segments from byte
 // zero at the MTU and every repair segment starts at a packet boundary, so a
@@ -8,8 +8,15 @@
 // range is unreachable through the switch. The clip exists so the charge
 // equals the absorbed bytes by construction rather than by that alignment
 // assumption, and that is what this asserts directly.
+//
+// The exemption is here for a different reason: it ends on one event, and a
+// bundle reports only how many flows re-armed, never on which event.
 
 #include "ns3/core-module.h"
+#include "ns3/custom-header.h"
+#include "ns3/qbb-header.h"
+#include "ns3/qbb-net-device.h"
+#include "ns3/rdma-hw.h"
 #include "ns3/rdma-queue-pair.h"
 
 #include <cstdint>
@@ -17,7 +24,13 @@
 #include <string>
 
 using ns3::CreateObject;
+using ns3::CustomHeader;
+using ns3::Ipv4Address;
 using ns3::Ptr;
+using ns3::QbbNetDevice;
+using ns3::RdmaHw;
+using ns3::RdmaInterfaceMgr;
+using ns3::RdmaQueuePair;
 using ns3::RdmaRxQueuePair;
 
 namespace {
@@ -32,12 +45,12 @@ void Expect(const std::string &law, uint64_t actual, uint64_t expected){
 	failures++;
 }
 
-void ExpectPulled(const std::string &law,
-		const RdmaRxQueuePair::PulledRange *actual, bool expected){
-	if ((actual != nullptr) == expected)
-		return;
-	std::cerr << "range algebra failed: " << law << "\n";
-	failures++;
+int cc_rearmed_events = 0;
+
+void CountTransportEvent(const char *event, uint64_t bytes){
+	(void)bytes;
+	if (std::string(event) == "cc_rearmed")
+		cc_rearmed_events++;
 }
 
 }  // namespace
@@ -95,37 +108,64 @@ int main(){
 		Expect("a repeated trim of a forgiven range charges nothing",
 			q->UnsettledBytes(4000, 5000), 0);
 	}
-	// A pulled range answers for every offset inside it, not only its start.
+	// The sender's exemption. A repair request says the receiver did not
+	// forgive this range, which a replay of an outstanding request also says,
+	// so only the allowance report may end it.
 	{
-		Ptr<RdmaRxQueuePair> q = CreateObject<RdmaRxQueuePair>();
-		q->RecordPulledRange(6000, 7000, true);
-		ExpectPulled("the recorded start is pulled",
-			q->FindPulledRange(6000), true);
-		ExpectPulled("an interior offset is pulled",
-			q->FindPulledRange(6500), true);
-		ExpectPulled("the exclusive end is not pulled",
-			q->FindPulledRange(7000), false);
-		ExpectPulled("an offset below the range is not pulled",
-			q->FindPulledRange(5999), false);
+		const Ipv4Address sender("11.0.0.1");
+		const Ipv4Address receiver("11.0.1.1");
+		Ptr<RdmaHw> hw = CreateObject<RdmaHw>();
+		hw->m_cc_mode = 0;
+		hw->m_ack_interval = 1;
+		hw->m_backto0 = false;
+		hw->m_retransmission_timeout_ns = 0;
+		hw->m_no_progress_timeout_ns = 0;
+		hw->m_max_retransmission_retries = 1024;
+		hw->m_selective_retransmission = true;
+		hw->m_transportEventCallback = ns3::MakeCallback(&CountTransportEvent);
+		Ptr<QbbNetDevice> device = CreateObject<QbbNetDevice>();
+		RdmaInterfaceMgr nic;
+		nic.dev = device;
+		hw->m_nic.push_back(nic);
+		hw->m_rtTable[receiver.Get()].push_back(0);
+
+		Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(
+			3, sender, receiver, 10000, 10001);
+		qp->m_size = 3000;
+		qp->snd_nxt = 2000;
+		qp->m_highest_sent = 2000;
+		qp->m_cc_exempt = true;
+		hw->m_qpMap[RdmaHw::GetQpKey(receiver.Get(), 10000, 3)] = qp;
+
+		CustomHeader request;
+		request.sip = receiver.Get();
+		request.dip = sender.Get();
+		request.ack.flags = 0;
+		request.ack.dport = 10000;
+		request.ack.sport = 10001;
+		request.ack.pg = 3;
+		request.ack.seq = 0;
+		request.ack.trim_payload_size = 1000;
+
+		hw->RecoverTrimmedQueue(qp, request);
+		hw->RecoverTrimmedQueue(qp, request);
+		Expect("a replayed repair request leaves the exemption in place",
+			qp->m_cc_exempt, 1);
+
+		// The report that the entry is spent, then two more of them. The
+		// exemption ends once, so a re-arm cannot be counted twice.
+		request.ack.seq = 1000;
+		request.ack.flags =
+			1 << ns3::qbbHeader::FLAG_ALLOWANCE_EXHAUSTED;
+		hw->RecoverTrimmedQueue(qp, request);
+		Expect("an allowance report ends the exemption", qp->m_cc_exempt, 0);
+		request.ack.seq = 2000;
+		hw->RecoverTrimmedQueue(qp, request);
+		hw->RecoverTrimmedQueue(qp, request);
+		Expect("the exemption ends once", cc_rearmed_events, 1);
+		Expect("every report is counted", qp->m_allowance_spent_signalled, 3);
 	}
-	// Pruning erases every settled entry, including one behind an entry that
-	// still straddles the frontier. A front-only pop leaves those forever.
-	{
-		Ptr<RdmaRxQueuePair> q = CreateObject<RdmaRxQueuePair>();
-		q->RecordPulledRange(1000, 3000, false);
-		q->RecordPulledRange(1500, 2000, false);
-		q->RecordPulledRange(4000, 5000, false);
-		q->ReceiverNextExpectedSeq = 2500;
-		q->PruneSettledPulls();
-		Expect("pruning erases settled entries behind an unsettled one",
-			q->m_pulled_ranges.size(), 2);
-		Expect("the straddling entry survives",
-			q->m_pulled_ranges.count(1000), 1);
-		Expect("the settled entry behind it is gone",
-			q->m_pulled_ranges.count(1500), 0);
-		Expect("the entry above the frontier survives",
-			q->m_pulled_ranges.count(4000), 1);
-	}
+	ns3::Simulator::Destroy();
 	if (failures > 0)
 		return 1;
 	std::cout << "range algebra laws hold\n";

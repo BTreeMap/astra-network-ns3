@@ -25,12 +25,11 @@ public:
  
   enum {
     FLAG_CNP = 0,
-    FLAG_TRIM_FTD = 1,
-    FLAG_TRIM_LASTHOP = 2,
-    // The receiver asks the sender to repair this range ahead of its other
-    // repairs. Advisory: the sender counts it, and cross-queue-pair ordering
-    // would need the egress scheduler, which is a hot path.
-    FLAG_PULL_PRIORITY = 3
+    FLAG_TRIM_LASTHOP = 1,
+    // The receiver reports that the budget entry this range belongs to has no
+    // allowance left. It is the only thing a sender cannot work out for
+    // itself, and the only thing that ends its congestion exemption.
+    FLAG_ALLOWANCE_EXHAUSTED = 2
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -47,9 +46,8 @@ public:
   void SetTs(uint64_t ts);
   void SetCnp();
   void SetTrimPayloadSize(uint32_t payloadSize);
-  void SetTrimFtd(bool forwardToDestination);
   void SetTrimLastHop(bool lastHop);
-  void SetPullPriority(bool priority);
+  void SetAllowanceExhausted(bool spent);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters
@@ -64,9 +62,8 @@ public:
   uint64_t GetTs() const;
   uint8_t GetCnp() const;
   uint32_t GetTrimPayloadSize() const;
-  bool IsTrimFtd() const;
   bool IsTrimLastHop() const;
-  bool IsPullPriority() const;
+  bool IsAllowanceExhausted() const;
 
   static TypeId GetTypeId (void);
   virtual TypeId GetInstanceTypeId (void) const;

@@ -423,19 +423,21 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, x == 2, ecnbits != 0);
+			ch.udp.ih, x == 2, ecnbits != 0, false);
 	}
 	return 0;
 }
 
 // The receiver's cumulative acknowledgement, shared by the in-order data path
 // and the forgiveness fork. The forgive path passes cnp true: the ACK it
-// emits carries FLAG_CNP, so ReceiveAck runs cnp_received_mlx exactly as a
-// pulled trim would and forgiving does not hide congestion. The debt is paid
-// by the ACK the forgive emits, not carried on whichever ACK comes next.
+// emits carries FLAG_CNP, so ReceiveAck delivers a congestion signal exactly
+// as a repaired trim would and forgiving does not hide congestion. The debt is
+// paid by the ACK the forgive emits, not carried on whichever ACK comes next.
+// It also carries the allowance report, because the charge that empties a
+// budget entry is a forgiveness and no repair request follows it.
 void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		const IntHeader &ih, bool nack, bool cnp){
+		const IntHeader &ih, bool nack, bool cnp, bool spent){
 	qbbHeader seqh;
 	seqh.SetSeq(q->ReceiverNextExpectedSeq);
 	seqh.SetPG(pg);
@@ -444,6 +446,7 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	seqh.SetIntHeader(ih);
 	if (cnp)
 		seqh.SetCnp();
+	seqh.SetAllowanceExhausted(spent);
 
 	Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
 	newp->AddHeader(seqh);
@@ -523,11 +526,13 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
-	// The flag reports congestion on the path, not on the bytes this ACK
-	// covers, so it is taken before the acknowledgement that may complete the
-	// queue pair and return. A forgiven trim rides its own ACK, and that ACK is
-	// often the one that closes the transfer.
-	if (cnp && m_cc_mode == 1){ // mlx version
+	// Both flags report on the path, not on the bytes this ACK covers, so both
+	// are read before the acknowledgement that may complete the queue pair and
+	// return. A forgiven trim rides its own ACK, and that ACK is often the one
+	// that closes the transfer. The re-arm comes first, so the congestion
+	// signal riding the same ACK reaches the controller.
+	EndExemptionIfAllowanceSpent(qp, ch);
+	if (cnp && m_cc_mode == 1 && DeliverCongestionSignal(qp)){ // mlx version
 		cnp_received_mlx(qp);
 	}
 	if (m_ack_interval == 0)
@@ -568,14 +573,21 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 		}
 	}
 
-	if (m_cc_mode == 3){
-		HandleAckHp(qp, p, ch);
-	}else if (m_cc_mode == 7){
-		HandleAckTimely(qp, p, ch);
-	}else if (m_cc_mode == 8){
-		HandleAckDctcp(qp, p, ch);
-	}else if (m_cc_mode == 10){
-		HandleAckHpPint(qp, p, ch);
+	// Modes 3, 7, 8 and 10 read congestion off every acknowledgement, so the
+	// dispatch itself is the delivery and the exemption is checked once here.
+	if (m_cc_mode == 3 || m_cc_mode == 7 || m_cc_mode == 8 ||
+			m_cc_mode == 10){
+		if (DeliverCongestionSignal(qp)){
+			if (m_cc_mode == 3){
+				HandleAckHp(qp, p, ch);
+			}else if (m_cc_mode == 7){
+				HandleAckTimely(qp, p, ch);
+			}else if (m_cc_mode == 8){
+				HandleAckDctcp(qp, p, ch);
+			}else{
+				HandleAckHpPint(qp, p, ch);
+			}
+		}
 	}
 	// ACK may advance the on-the-fly window, allowing more packets to send
 	ArmRetransmissionTimeout(qp);
@@ -610,16 +622,15 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 // (DSCP_CONTROL / TC_high) and carries only the identity of the lost packet.
 void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool priority){
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent){
 	qbbHeader repair;
 	repair.SetSeq(seq);
 	repair.SetPG(pg);
 	repair.SetSport(sport);
 	repair.SetDport(dport);
 	repair.SetTrimPayloadSize(payloadSize);
-	repair.SetTrimFtd(true);
 	repair.SetTrimLastHop(lastHop);
-	repair.SetPullPriority(priority);
+	repair.SetAllowanceExhausted(spent);
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
@@ -644,18 +655,37 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	m_nic[nicIdx].dev->TriggerTransmit();
 }
 
+// The receiver's report that the budget entry has no allowance left, which is
+// the one thing about a shared budget a sender cannot work out for itself. It
+// arrives on a repair request and on a forgiveness acknowledgement, because
+// the charge that empties an entry is a forgiveness and no request follows it.
+void RdmaHw::EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
+		const CustomHeader &ch){
+	if (!((ch.ack.flags >> qbbHeader::FLAG_ALLOWANCE_EXHAUSTED) & 1))
+		return;
+	qp->m_allowance_spent_signalled++;
+	ReportTransportEvent("allowance_spent_signalled", 0);
+	if (!qp->m_cc_exempt)
+		return;
+	qp->m_cc_exempt = false;
+	qp->m_cc_rearmed_ns = Simulator::Now().GetNanoSeconds();
+	ReportTransportEvent("cc_rearmed", 0);
+}
+
+bool RdmaHw::DeliverCongestionSignal(Ptr<RdmaQueuePair> qp){
+	if (!qp->m_cc_exempt)
+		return true;
+	qp->m_cc_signals_withheld++;
+	ReportTransportEvent("cc_signal_withheld", 0);
+	return false;
+}
+
 void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
-		const CustomHeader &ch, bool isFtdRepair){
-	if (qp->m_cc_exempt){
-		// A PULL is the receiver refusing to forgive, and refusal is the only
-		// visible edge of a budget shared across every sender to that rank. It
-		// ends the exemption before the stale check, because a stale PULL is
-		// still a refusal, and before the rate cut below, so this trim's own
-		// CNP is taken.
-		qp->m_cc_exempt = false;
-		qp->m_cc_rearmed_ns = Simulator::Now().GetNanoSeconds();
-		ReportTransportEvent("cc_rearmed", 0);
-	}
+		const CustomHeader &ch){
+	// Before the stale check, because a stale report still describes a spent
+	// entry, and before the rate cut below, so this trim's own congestion
+	// signal reaches the controller.
+	EndExemptionIfAllowanceSpent(qp, ch);
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
@@ -679,23 +709,15 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 	if (qp->m_first_trim_ns == 0)
 		qp->m_first_trim_ns = Simulator::Now().GetNanoSeconds();
 	qp->m_trimmed_payload_bytes += ch.ack.trim_payload_size;
-	if (isFtdRepair) {
-		qp->m_trim_ftd_repairs++;
-	} else {
-		qp->m_trim_bts_notifications++;
-	}
 	if (lastHop) {
 		qp->m_trim_lasthop_notifications++;
-	}
-	if ((ch.ack.flags >> qbbHeader::FLAG_PULL_PRIORITY) & 1) {
-		qp->m_priority_pulls++;
 	}
 	qp->m_trim_recovery_events++;
 	// UEC 1.0.3 p. 356 excludes DSCP_TRIMMED_LASTHOP from the congestion signal
 	// only where RCCC covers the last hop; without RCCC, dropping the cut is
 	// what leaves destination incast entirely uncontrolled, so mode 1 reacts to
 	// every trim.
-	if (m_cc_mode == 1) {
+	if (m_cc_mode == 1 && DeliverCongestionSignal(qp)) {
 		cnp_received_mlx(qp);
 	}
 	if (m_selective_retransmission){
@@ -714,12 +736,11 @@ void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 }
 
 // A trimmed data packet at its destination, under the recovery domain. The
-// range is in exactly one of three states and each has one answer:
-// settled (received, or already forgiven) is acknowledged as a duplicate;
-// pulled repeats the PULL it already sent, at the same priority, because two
-// PULLs at different priorities for one range is not a state the sender can
-// resolve; unknown asks the verdict callback once, and the answer is sticky
-// because forgiving is absorbing and pulling is recorded.
+// range is settled (received, or already forgiven) and acknowledged as a
+// duplicate, or it is asked about. The verdict is recomputed on every
+// request rather than cached, because the allowance moves under it: charges
+// shrink it and later launches grow it. Recomputing is also what a lost
+// first request needs.
 //
 // The verdict is asked about the unsettled bytes, never the whole trimmed
 // range. A repair re-segmenter can trim a range that straddles the cumulative
@@ -743,7 +764,7 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	const uint64_t unsettled = q->UnsettledBytes(start, end);
 	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, false);
+			ch.udp.ih, false, false, false);
 		return;
 	}
 	if (unsettled < payloadSize){
@@ -752,16 +773,12 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// asserting an identity that holds vacuously.
 		ReportTransportEvent("clipped_trim", 0);
 	}
-	if (const RdmaRxQueuePair::PulledRange* pulled = q->FindPulledRange(start)){
-		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, payloadSize, lastHop, pulled->priority);
-		return;
-	}
 	const uint8_t verdict = m_recoveryVerdictCallback.IsNull()
-		? static_cast<uint8_t>(VERDICT_PULL)
+		? uint8_t{0}
 		: m_recoveryVerdictCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
 			start, static_cast<uint32_t>(unsettled));
-	if (verdict == VERDICT_FORGIVE){
+	const bool spent = (verdict & kAllowanceSpent) != 0;
+	if (verdict & kForgive){
 		// Forgiving is absorbing: the range joins the accepted out-of-order
 		// set as though it had arrived, so the cumulative sequence can pass it
 		// and no repair is ever requested. It absorbs exactly the unsettled
@@ -774,21 +791,17 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		if (start <= expected){
 			q->ReceiverNextExpectedSeq =
 				static_cast<uint32_t>(q->AbsorbContiguousFrom(expected));
-			if (!q->m_pulled_ranges.empty())
-				q->PruneSettledPulls();
 		}
 		// UEC 1.0.3 p. 356 keeps a last-hop trim out of the congestion signal
 		// only where RCCC covers the last hop; this transport has none, so the
 		// debt is owed for every trim the sender would otherwise have seen, and
 		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, true);
+			ch.udp.ih, false, true, spent);
 		return;
 	}
-	const bool priority = verdict == VERDICT_PULL_PRIORITY;
-	q->RecordPulledRange(start, end, priority);
 	SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-		ch.udp.seq, payloadSize, lastHop, priority);
+		ch.udp.seq, payloadSize, lastHop, spent);
 }
 
 int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
@@ -812,13 +825,12 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 		return 0;
 	}
 
-	// Back-to-sender notification (not a UEC 1.0.3 mechanism) arriving directly
-	// at the original sender, or the NACK returned by the destination.
+	// The repair request the destination returned.
 	Ptr<RdmaQueuePair> qp = GetQp(ch.sip, ch.ack.dport, ch.ack.pg);
 	if (!qp || qp->IsFailed()) {
 		return 0;
 	}
-	RecoverTrimmedQueue(qp, ch, ch.l3Prot == kUecTrimRepairProtocol);
+	RecoverTrimmedQueue(qp, ch);
 	return 0;
 }
 
@@ -832,10 +844,6 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			advanced = q->AbsorbContiguousFrom(advanced);
 		}
 		q->ReceiverNextExpectedSeq = static_cast<uint32_t>(advanced);
-		// Emptiness first: this is the per-packet receive path, and the map is
-		// empty in every arm that does not run the recovery domain.
-		if (!q->m_pulled_ranges.empty())
-			q->PruneSettledPulls();
 		if (q->ReceiverNextExpectedSeq >= static_cast<uint32_t>(q->m_milestone_rx)){
 			// Single step, as the original transport did. A lagging milestone
 			// only means the next packets also generate cumulative ACKs, which
@@ -1177,16 +1185,6 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q){
 }
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
-	if (q->m_cc_exempt){
-		// The exemption covers every congestion signal the sender would take,
-		// not only the trim-originated ones: ECN marks start far below the
-		// queue depth that trims, so leaving them in place would keep most of
-		// the rate cuts and move nothing. Bounded loss pays for the congestion
-		// instead, and the receiver's first refusal to forgive ends this.
-		q->m_cnp_ignored++;
-		ReportTransportEvent("cnp_ignored", 0);
-		return;
-	}
 	q->m_cnp_received++;
 	ReportTransportEvent("cnp_taken", 0);
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update

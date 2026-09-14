@@ -39,17 +39,15 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_trimmed_payload_bytes = 0;
 	m_recovery_events = 0;
 	m_trim_notifications = 0;
-	m_trim_ftd_repairs = 0;
-	m_trim_bts_notifications = 0;
 	m_trim_lasthop_notifications = 0;
 	m_trim_recovery_events = 0;
 	m_stale_trim_notifications = 0;
 	m_recovery_retries = 0;
 	m_timeouts = 0;
 	m_cnp_received = 0;
-	m_priority_pulls = 0;
 	m_cc_exempt = false;
-	m_cnp_ignored = 0;
+	m_cc_signals_withheld = 0;
+	m_allowance_spent_signalled = 0;
 	m_cc_rearmed_ns = 0;
 	m_first_trim_ns = 0;
 	m_first_repair_ns = 0;
@@ -398,37 +396,6 @@ uint64_t RdmaRxQueuePair::UnsettledBytes(uint64_t start, uint64_t end) const{
 			unsettled -= overlap_end - overlap_start;
 	}
 	return unsettled;
-}
-
-const RdmaRxQueuePair::PulledRange* RdmaRxQueuePair::FindPulledRange(
-		uint64_t offset) const{
-	if (m_pulled_ranges.empty())
-		return nullptr;
-	auto it = m_pulled_ranges.upper_bound(offset);
-	if (it == m_pulled_ranges.begin())
-		return nullptr;
-	--it;
-	return it->second.end > offset ? &it->second : nullptr;
-}
-
-void RdmaRxQueuePair::RecordPulledRange(uint64_t start, uint64_t end,
-		bool priority){
-	m_pulled_ranges[start] = PulledRange{end, priority};
-}
-
-void RdmaRxQueuePair::PruneSettledPulls(){
-	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
-	// An entry starting at or above the cumulative sequence ends above it, so
-	// the scan stops there. Below it every settled entry is erased, including
-	// one sitting behind an entry that still straddles the frontier; a
-	// front-only pop would leave those in place forever.
-	const auto limit = m_pulled_ranges.lower_bound(expected);
-	for (auto it = m_pulled_ranges.begin(); it != limit; ){
-		if (it->second.end <= expected)
-			it = m_pulled_ranges.erase(it);
-		else
-			++it;
-	}
 }
 
 /*********************

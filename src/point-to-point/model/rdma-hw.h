@@ -79,16 +79,18 @@ public:
 	TransportEventCallback m_transportEventCallback;
 	void ReportTransportEvent(const char* event, uint64_t bytes);
 
-	// What the receiver does with a trimmed range it has no decision for.
-	// The transport is semantics-blind: it never reads a training step, a
+	// What the receiver does with one trimmed range, and what it reports
+	// about the budget entry the range belongs to. The two are independent:
+	// forgiving a range can be the charge that empties the entry. The
+	// transport is semantics-blind and never reads a training step, a
 	// critical-learning-regime label, or a budget.
 	enum RecoveryVerdict : uint8_t {
-		VERDICT_PULL = 0,
-		VERDICT_FORGIVE = 1,
-		VERDICT_PULL_PRIORITY = 2,
+		kForgive = 1 << 0,
+		kAllowanceSpent = 1 << 1,
 	};
-	// (sip, dip, sport, dport, seq, len) -> RecoveryVerdict. Unset means pull,
-	// which is the behaviour of a transport with no recovery domain at all.
+	// (sip, dip, sport, dport, seq, len) -> RecoveryVerdict. Unset means zero,
+	// a repair with allowance left, which is the behaviour of a transport with
+	// no recovery domain at all.
 	typedef Callback<uint8_t, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
 		uint32_t> RecoveryVerdictCallback;
 	RecoveryVerdictCallback m_recoveryVerdictCallback;
@@ -128,14 +130,22 @@ public:
 	static uint16_t EtherToPpp (uint16_t protocol);
 
 	void RecoverQueue(Ptr<RdmaQueuePair> qp);
-	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch,
-		bool isFtdRepair);
+	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
 	void SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool priority);
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent);
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		const IntHeader &ih, bool nack, bool cnp);
+		const IntHeader &ih, bool nack, bool cnp, bool spent);
+	// Read the receiver's allowance report off an arriving repair request or
+	// acknowledgement, and end the exemption when it says the entry is spent.
+	void EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
+		const CustomHeader &ch);
+	// Hand one congestion observation to whichever controller is configured.
+	// False means the queue pair is exempt and the controller never hears of
+	// it, which is the whole of the exemption: no controller state moves,
+	// so none of their behaviour is ours to defend.
+	bool DeliverCongestionSignal(Ptr<RdmaQueuePair> qp);
 	void ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		bool lastHop);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
