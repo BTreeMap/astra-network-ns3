@@ -324,6 +324,7 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
+	m_last_arrival_ns = 0;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){
@@ -396,6 +397,22 @@ uint64_t RdmaRxQueuePair::UnsettledBytes(uint64_t start, uint64_t end) const{
 			unsettled -= overlap_end - overlap_start;
 	}
 	return unsettled;
+}
+
+uint64_t RdmaRxQueuePair::AcceptedBytesAbove(uint64_t expected) const{
+	uint64_t accepted = 0;
+	// The same scan UnsettledBytes runs, open-ended above: the entries are
+	// disjoint, and the one entry beginning at or below `expected` is the only
+	// one that can reach into the range from the left.
+	auto it = m_ooo_ranges.upper_bound(expected);
+	if (it != m_ooo_ranges.begin())
+		--it;
+	for (; it != m_ooo_ranges.end(); ++it){
+		const uint64_t start = std::max(it->first, expected);
+		if (it->second > start)
+			accepted += it->second - start;
+	}
+	return accepted;
 }
 
 /*********************

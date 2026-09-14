@@ -100,6 +100,22 @@ public:
 	typedef Callback<bool, uint32_t, uint32_t, uint16_t, uint16_t>
 		CongestionExemptionCallback;
 	CongestionExemptionCallback m_congestionExemptionCallback;
+	// (sip, dip, sport, dport, next_expected, accepted_above) -> the end offset
+	// the receiver may absorb without waiting for it, or zero to refuse. A
+	// second callback rather than a struct on the trim path: the trim verdict
+	// never needs an end, and the remainder verdict never needs bits. The
+	// frontend knows the flow's size and the transport knows what arrived, so
+	// the transport supplies both edges of the hole and the frontend charges
+	// the difference. Unset means the straggler stop is off, which is the
+	// transport with no v2 policy at all.
+	typedef Callback<uint64_t, uint32_t, uint32_t, uint16_t, uint16_t,
+		uint64_t, uint64_t> RemainderVerdictCallback;
+	RemainderVerdictCallback m_remainderVerdictCallback;
+	// How long a receive queue pair must go quiet before the remainder is
+	// asked about. Zero asks at every arrival, which is stop-at-(1-p) as the
+	// degenerate point of the rule; the callback being unset is what disables
+	// the stop, so this value never has to mean "off".
+	uint64_t m_straggler_idle_ns;
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice
@@ -148,6 +164,12 @@ public:
 	bool DeliverCongestionSignal(Ptr<RdmaQueuePair> qp);
 	void ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		bool lastHop);
+	// The straggler stop, in three parts: an arrival stamps the queue pair and
+	// arms at most one timer, the timer decides whether the quiet was long
+	// enough, and the question absorbs whatever the frontend grants.
+	void NoteDataArrival(Ptr<RdmaRxQueuePair> q);
+	void CheckStragglerIdle(Ptr<RdmaRxQueuePair> q);
+	void AskRemainderVerdict(Ptr<RdmaRxQueuePair> q);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);

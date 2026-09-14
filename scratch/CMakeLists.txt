@@ -24,13 +24,17 @@ build_exec(
   EXECUTABLE_DIRECTORY_PATH "${PROJECT_SOURCE_DIR}/build/scratch/"
 )
 
-# The receive-side range algebra the recovery domain charges from. Its
-# straddle and partial-overlap branches are unreachable through the switch,
-# because every packet and every repair segment starts at a packet boundary,
-# so they are asserted here instead of through a fabric fixture.
+# The receive-side range algebra the recovery domain charges from, and the
+# forgiveness core it charges. The algebra's straddle and partial-overlap
+# branches are unreachable through the switch, because every packet and every
+# repair segment starts at a packet boundary; the core's laws hold over states
+# no fabric run reaches. Both are asserted here instead of through a fabric
+# fixture. The astra-sim directories are on the include path for
+# ExperimentConfig.hh, which is header-only and needs no library.
 build_exec(
   EXECNAME RdmaRangeAlgebra
   SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/rdma-range-algebra.cc
+  DIRECTORY_PATHS ${astra-sim-dir} ${astra-sim-dir}/extern/helper
   LIBRARIES_TO_LINK "${astra-sim-ns3-libs-list}"
   EXECUTABLE_DIRECTORY_PATH "${PROJECT_SOURCE_DIR}/build/scratch/"
 )

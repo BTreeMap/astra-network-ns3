@@ -179,6 +179,11 @@ public:
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	// Out-of-order payload ranges accepted under selective retransmission.
 	std::map<uint64_t, uint64_t> m_ooo_ranges;
+	// Straggler stop. The simulated time of the last data arrival and the one
+	// pending idle question, which DeleteRxQp cancels. Zero time means no
+	// data has arrived: no packet can arrive before the transfer's first send.
+	uint64_t m_last_arrival_ns;
+	EventId m_stragglerTimer;
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);
@@ -190,6 +195,11 @@ public:
 	// absorb, so a ledger charged this figure charges what it takes. Zero
 	// means the range is settled and the trim is a duplicate.
 	uint64_t UnsettledBytes(uint64_t start, uint64_t end) const;
+	// Bytes at or above `expected` the receiver has already accepted out of
+	// order, which under selective repeat is everything that arrived past the
+	// gap the flow is stalled on. The straggler stop subtracts it, because a
+	// byte that arrived is not a byte to forgive.
+	uint64_t AcceptedBytesAbove(uint64_t expected) const;
 };
 
 class RdmaQueuePairGroup : public Object {

@@ -343,12 +343,14 @@ void accumulate_transport_event(const string &event, const char *plane,
 // no bytes. It rides the control plane because that is what it answers to: a
 // retransmission timeout is the absence of an ACK, a rate cut is a CNP.
 void record_host_transport_event(const char *event, uint64_t bytes) {
-  // A forgiven trim accounts for payload bytes that were never delivered, so
-  // it rides the data plane beside the switch's own trim events. The other
-  // reactions carry no packet and answer to the control plane: a
+  // The two forgiveness events account for payload bytes no receiver was ever
+  // given, so they ride the data plane beside the switch's own trim events.
+  // The other reactions carry no packet and answer to the control plane: a
   // retransmission timeout is a missing ACK, a rate cut is a CNP.
-  const char *plane =
-      strcmp(event, "trim_forgiven") == 0 ? "data" : "control";
+  const char *plane = (strcmp(event, "trim_forgiven") == 0 ||
+                       strcmp(event, "remainder_forgiven") == 0)
+                          ? "data"
+                          : "control";
   accumulate_transport_event(event, plane, bytes);
 }
 
@@ -1139,10 +1141,12 @@ void SetConfig() {
 }
 
 // `recovery_verdict` is the experiment layer's answer to "what do I do with
-// this trimmed range" and `congestion_exemption` its answer to "may this queue
-// pair ignore congestion": the transport asks, it never decides. Null callbacks
-// with `forgiveness` and `congestion_exempt` false leave the pull-everything,
-// congestion-obeying transport untouched.
+// this trimmed range", `congestion_exemption` its answer to "may this queue
+// pair ignore congestion", and `remainder_verdict` its answer to "may I take
+// this quiet flow's unsent remainder as delivered": the transport asks, it
+// never decides. Null callbacks with `forgiveness` and `congestion_exempt`
+// false leave the pull-everything, congestion-obeying transport untouched, and
+// a null `remainder_verdict` is what disables the straggler stop.
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
                   uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
@@ -1151,7 +1155,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   bool forgiveness = false,
                   bool (*congestion_exemption)(uint32_t, uint32_t, uint16_t,
                                                uint16_t) = nullptr,
-                  bool congestion_exempt = false) {
+                  bool congestion_exempt = false,
+                  uint64_t (*remainder_verdict)(uint32_t, uint32_t, uint16_t,
+                                                uint16_t, uint64_t,
+                                                uint64_t) = nullptr,
+                  uint64_t straggler_idle_ns = 0) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1447,6 +1455,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       if (congestion_exemption != nullptr)
         rdmaHw->m_congestionExemptionCallback =
             MakeCallback(congestion_exemption);
+      if (remainder_verdict != nullptr)
+        rdmaHw->m_remainderVerdictCallback = MakeCallback(remainder_verdict);
+      rdmaHw->SetAttribute("StragglerIdleNs",
+                           UintegerValue(straggler_idle_ns));
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

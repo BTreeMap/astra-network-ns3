@@ -101,6 +101,15 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_congestionExemption),
 				MakeBooleanChecker())
+		.AddAttribute("StragglerIdleNs",
+				"How long a receive queue pair must go without a data arrival "
+				"before the receiver offers to forgive the sender's unsent "
+				"remainder. Zero asks at every arrival. Read only when the "
+				"remainder-verdict callback is set, which is what enables the "
+				"straggler stop.",
+				UintegerValue(0),
+				MakeUintegerAccessor(&RdmaHw::m_straggler_idle_ns),
+				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -247,6 +256,10 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"CongestionExemption needs Forgiveness: the receiver's refusal to "
 		"forgive is the only signal that ends an exemption, so without "
 		"forgiveness an exempt queue pair would never take a rate cut again");
+	NS_ABORT_MSG_IF(!m_remainderVerdictCallback.IsNull() &&
+			!m_selective_retransmission,
+		"The straggler stop needs SelectiveRetransmission: a forgiven "
+		"remainder is absorbed as an accepted out-of-order range");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -369,7 +382,14 @@ uint32_t RdmaHw::GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q){
 }
 void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport){
 	uint64_t key = ((uint64_t)dip << 32) | ((uint64_t)pg << 16) | (uint64_t)dport;
-	m_rxQpMap.erase(key);
+	auto it = m_rxQpMap.find(key);
+	if (it == m_rxQpMap.end())
+		return;
+	// The pending idle question holds a reference to this queue pair, so
+	// leaving it armed both keeps the object alive and asks about a flow that
+	// has finished.
+	Simulator::Cancel(it->second->m_stragglerTimer);
+	m_rxQpMap.erase(it);
 }
 
 void RdmaHw::PCIeResume(uint32_t nic_idx, uint32_t qIndex){
@@ -425,6 +445,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, x == 2, ecnbits != 0, false);
 	}
+	// After the acknowledgement, so the straggler stop reads the cumulative
+	// sequence this packet already advanced.
+	NoteDataArrival(rxQp);
 	return 0;
 }
 
@@ -802,6 +825,81 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 	}
 	SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 		ch.udp.seq, payloadSize, lastHop, spent);
+}
+
+// The straggler stop, change S of FORGIVE v2. A forgiven trimmed byte saves
+// its repair; a forgiven unsent byte saves its transmission too, so once a
+// flow has gone quiet the receiver offers to take the rest of it as delivered.
+//
+// One timestamp and one event per receive queue pair. An arrival arms the
+// event only when none is pending, so the cost is O(1) per packet and the
+// scheduler holds at most one entry per open receive queue pair.
+void RdmaHw::NoteDataArrival(Ptr<RdmaRxQueuePair> q){
+	if (m_remainderVerdictCallback.IsNull())
+		return;
+	q->m_last_arrival_ns = Simulator::Now().GetNanoSeconds();
+	if (m_straggler_idle_ns == 0){
+		// No quiet period to wait out, so the question is asked at every
+		// arrival and the budget alone decides when the remainder fits.
+		AskRemainderVerdict(q);
+		return;
+	}
+	if (!q->m_stragglerTimer.IsRunning())
+		q->m_stragglerTimer = Simulator::Schedule(
+			NanoSeconds(m_straggler_idle_ns), &RdmaHw::CheckStragglerIdle,
+			this, q);
+}
+
+// Data that arrived while the event was pending moved the deadline, so the
+// event reschedules to the new one instead of the arrival re-arming it. After
+// the question it does not re-arm; the next arrival will.
+void RdmaHw::CheckStragglerIdle(Ptr<RdmaRxQueuePair> q){
+	const uint64_t idle =
+		Simulator::Now().GetNanoSeconds() - q->m_last_arrival_ns;
+	if (idle < m_straggler_idle_ns){
+		q->m_stragglerTimer = Simulator::Schedule(
+			NanoSeconds(m_straggler_idle_ns - idle),
+			&RdmaHw::CheckStragglerIdle, this, q);
+		return;
+	}
+	AskRemainderVerdict(q);
+}
+
+// The receive queue pair knows how far its cumulative sequence has reached and
+// not how large the flow is, so it asks with the former and the frontend
+// answers with the end offset. Absorbing that range is what a forgiven trim
+// already does, and the acknowledgement it emits carries the flow size, so the
+// sender completes through the IsFinished it already had.
+void RdmaHw::AskRemainderVerdict(Ptr<RdmaRxQueuePair> q){
+	const uint64_t expected = q->ReceiverNextExpectedSeq;
+	// Under selective repeat the flow stalls on a gap while later packets keep
+	// arriving, so the bytes above the cumulative sequence are not all
+	// missing. The frontend is told how many of them arrived, because charging
+	// them would spend the budget on bytes the receiver already holds.
+	const uint64_t end = m_remainderVerdictCallback(q->dip, q->sip, q->dport,
+		q->sport, expected, q->AcceptedBytesAbove(expected));
+	// A refusal emits nothing. No repair is requested here, so no exemption
+	// ends on it; the next trim carries the allowance report if the cap is
+	// spent.
+	if (end <= expected)
+		return;
+	// Exactly what the absorb below takes, and exactly what the frontend
+	// charged, so the two sinks agree by construction rather than by the two
+	// sides computing the hole the same way.
+	const uint64_t forgiven = q->UnsettledBytes(expected, end);
+	q->AddOutOfOrderRange(expected, end);
+	q->ReceiverNextExpectedSeq =
+		static_cast<uint32_t>(q->AbsorbContiguousFrom(expected));
+	// Beside trim_forgiven, and separate from it: these bytes were never put
+	// on the wire, so they were never trimmed and W does not count them.
+	ReportTransportEvent("remainder_forgiven", forgiven);
+	// No congestion notification. A trim owes the sender the rate cut the
+	// fabric would have signalled; an unsent byte congested nothing. The ECN
+	// account's queue index is the priority group GetRxQp created this queue
+	// pair with, and the group is part of the map key, so every packet that
+	// finds this queue pair carries that same group.
+	SendAck(q, q->sip, q->dip, q->sport, q->dport, q->m_ecn_source.qIndex,
+		IntHeader(), false, false, false);
 }
 
 int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
