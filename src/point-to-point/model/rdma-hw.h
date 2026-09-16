@@ -106,17 +106,26 @@ public:
 	// never needs an end, and the remainder verdict never needs bits. The
 	// frontend knows the flow's size and the transport knows what arrived, so
 	// the transport supplies both edges of the hole and the frontend charges
-	// the difference. Unset means the straggler stop is off, which is the
-	// transport with no v2 policy at all.
+	// the difference. The transport asks at every accepted arrival and the
+	// frontend decides; unset means nothing asks, which is the transport with
+	// no step stop at all.
 	typedef Callback<uint64_t, uint32_t, uint32_t, uint16_t, uint16_t,
 		uint64_t, uint64_t> RemainderVerdictCallback;
 	RemainderVerdictCallback m_remainderVerdictCallback;
-	// How long a receive queue pair must go quiet before the remainder is
-	// asked about. Zero asks at every arrival, which is stop-at-(1-p) as the
-	// degenerate point of the rule; the callback being unset is what disables
-	// the stop, so this value never has to mean "off".
-	uint64_t m_straggler_idle_ns;
-
+	// (sip, dip, sport, dport, bytes) -> the payload bytes this arrival added
+	// to what the receiver holds. A NIC accounts for a byte when it accepts
+	// it, so the receiver-local budget grows here rather than at completion.
+	// Only newly accepted bytes are reported: a duplicate adds nothing, and a
+	// forgiven range was absorbed without data, so neither is counted twice.
+	// Unset means the experiment layer keeps no receiver-side account.
+	typedef Callback<void, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t>
+		DataAcceptedCallback;
+	DataAcceptedCallback m_dataAcceptedCallback;
+	// What one arriving data packet would add, measured before the receive
+	// state moves. Go-back-N accepts nothing out of order, and a range the
+	// receiver already holds adds nothing.
+	uint64_t AcceptedPayloadBytes(Ptr<RdmaRxQueuePair> q, uint32_t seq,
+		uint32_t size) const;
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb, QpFailureCallback failure_cb); // setup shared data and callbacks with the QbbNetDevice
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
@@ -164,12 +173,10 @@ public:
 	bool DeliverCongestionSignal(Ptr<RdmaQueuePair> qp);
 	void ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		bool lastHop);
-	// The straggler stop, in three parts: an arrival stamps the queue pair and
-	// arms at most one timer, the timer decides whether the quiet was long
-	// enough, and the question absorbs whatever the frontend grants.
-	void NoteDataArrival(Ptr<RdmaRxQueuePair> q);
-	void CheckStragglerIdle(Ptr<RdmaRxQueuePair> q);
-	void AskRemainderVerdict(Ptr<RdmaRxQueuePair> q);
+	// The step stop's question, asked at every accepted arrival and answered
+	// by the frontend, which holds the budget and the step's plan; the
+	// question absorbs whatever the frontend grants.
+	void AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);

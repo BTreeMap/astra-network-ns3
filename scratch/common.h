@@ -1144,9 +1144,12 @@ void SetConfig() {
 // this trimmed range", `congestion_exemption` its answer to "may this queue
 // pair ignore congestion", and `remainder_verdict` its answer to "may I take
 // this quiet flow's unsent remainder as delivered": the transport asks, it
-// never decides. Null callbacks with `forgiveness` and `congestion_exempt`
-// false leave the pull-everything, congestion-obeying transport untouched, and
-// a null `remainder_verdict` is what disables the straggler stop.
+// never decides. `data_accepted` is the one report in the other direction, the
+// payload bytes an arrival added to what the receiver holds, which is what the
+// receiver-local budget is measured against. Null callbacks with
+// `forgiveness` and `congestion_exempt` false leave the pull-everything,
+// congestion-obeying transport untouched, and a null `remainder_verdict` is
+// what disables the step stop.
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
                   uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
@@ -1159,7 +1162,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   uint64_t (*remainder_verdict)(uint32_t, uint32_t, uint16_t,
                                                 uint16_t, uint64_t,
                                                 uint64_t) = nullptr,
-                  uint64_t straggler_idle_ns = 0) {
+                  void (*data_accepted)(uint32_t, uint32_t, uint16_t, uint16_t,
+                                        uint64_t) = nullptr) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1457,8 +1461,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
             MakeCallback(congestion_exemption);
       if (remainder_verdict != nullptr)
         rdmaHw->m_remainderVerdictCallback = MakeCallback(remainder_verdict);
-      rdmaHw->SetAttribute("StragglerIdleNs",
-                           UintegerValue(straggler_idle_ns));
+      if (data_accepted != nullptr)
+        rdmaHw->m_dataAcceptedCallback = MakeCallback(data_accepted);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

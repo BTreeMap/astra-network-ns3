@@ -101,15 +101,6 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_congestionExemption),
 				MakeBooleanChecker())
-		.AddAttribute("StragglerIdleNs",
-				"How long a receive queue pair must go without a data arrival "
-				"before the receiver offers to forgive the sender's unsent "
-				"remainder. Zero asks at every arrival. Read only when the "
-				"remainder-verdict callback is set, which is what enables the "
-				"straggler stop.",
-				UintegerValue(0),
-				MakeUintegerAccessor(&RdmaHw::m_straggler_idle_ns),
-				MakeUintegerChecker<uint64_t>())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -258,8 +249,8 @@ void RdmaHw::Setup(QpCompleteCallback cb, QpFailureCallback failure_cb){
 		"forgiveness an exempt queue pair would never take a rate cut again");
 	NS_ABORT_MSG_IF(!m_remainderVerdictCallback.IsNull() &&
 			!m_selective_retransmission,
-		"The straggler stop needs SelectiveRetransmission: a forgiven "
-		"remainder is absorbed as an accepted out-of-order range");
+		"The step stop needs SelectiveRetransmission: a forgiven remainder is "
+		"absorbed as an accepted out-of-order range");
 	for (uint32_t i = 0; i < m_nic.size(); i++){
 		Ptr<QbbNetDevice> dev = m_nic[i].dev;
 		if (!dev)
@@ -385,10 +376,6 @@ void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport){
 	auto it = m_rxQpMap.find(key);
 	if (it == m_rxQpMap.end())
 		return;
-	// The pending idle question holds a reference to this queue pair, so
-	// leaving it armed both keeps the object alive and asks about a flow that
-	// has finished.
-	Simulator::Cancel(it->second->m_stragglerTimer);
 	m_rxQpMap.erase(it);
 }
 
@@ -439,15 +426,25 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	// go-back-N delivers up to a full window of out-of-order packets, so a
 	// per-packet line here floods stdout exactly when the fabric is doing
 	// what a congestion experiment asks of it.
+	// Before the check, because the check is what moves the receive state and
+	// the account is of what this packet added to it.
+	const uint64_t accepted =
+		AcceptedPayloadBytes(rxQp, ch.udp.seq, payload_size);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+	if (accepted > 0 && !m_dataAcceptedCallback.IsNull())
+		m_dataAcceptedCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+			accepted);
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, x == 2, ecnbits != 0, false);
 	}
-	// After the acknowledgement, so the straggler stop reads the cumulative
-	// sequence this packet already advanced.
-	NoteDataArrival(rxQp);
+	// After the acknowledgement, so the question reads the cumulative sequence
+	// this packet already advanced. Asked on every accepted arrival: the
+	// frontend answers no until the step's plan says this sender is done, so
+	// the transport needs no timer and no threshold of its own.
+	if (accepted > 0 && !m_remainderVerdictCallback.IsNull())
+		AskRemainderOnArrival(rxQp);
 	return 0;
 }
 
@@ -827,50 +824,13 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		ch.udp.seq, payloadSize, lastHop, spent);
 }
 
-// The straggler stop, change S of FORGIVE v2. A forgiven trimmed byte saves
-// its repair; a forgiven unsent byte saves its transmission too, so once a
-// flow has gone quiet the receiver offers to take the rest of it as delivered.
-//
-// One timestamp and one event per receive queue pair. An arrival arms the
-// event only when none is pending, so the cost is O(1) per packet and the
-// scheduler holds at most one entry per open receive queue pair.
-void RdmaHw::NoteDataArrival(Ptr<RdmaRxQueuePair> q){
-	if (m_remainderVerdictCallback.IsNull())
-		return;
-	q->m_last_arrival_ns = Simulator::Now().GetNanoSeconds();
-	if (m_straggler_idle_ns == 0){
-		// No quiet period to wait out, so the question is asked at every
-		// arrival and the budget alone decides when the remainder fits.
-		AskRemainderVerdict(q);
-		return;
-	}
-	if (!q->m_stragglerTimer.IsRunning())
-		q->m_stragglerTimer = Simulator::Schedule(
-			NanoSeconds(m_straggler_idle_ns), &RdmaHw::CheckStragglerIdle,
-			this, q);
-}
-
-// Data that arrived while the event was pending moved the deadline, so the
-// event reschedules to the new one instead of the arrival re-arming it. After
-// the question it does not re-arm; the next arrival will.
-void RdmaHw::CheckStragglerIdle(Ptr<RdmaRxQueuePair> q){
-	const uint64_t idle =
-		Simulator::Now().GetNanoSeconds() - q->m_last_arrival_ns;
-	if (idle < m_straggler_idle_ns){
-		q->m_stragglerTimer = Simulator::Schedule(
-			NanoSeconds(m_straggler_idle_ns - idle),
-			&RdmaHw::CheckStragglerIdle, this, q);
-		return;
-	}
-	AskRemainderVerdict(q);
-}
-
-// The receive queue pair knows how far its cumulative sequence has reached and
-// not how large the flow is, so it asks with the former and the frontend
-// answers with the end offset. Absorbing that range is what a forgiven trim
-// already does, and the acknowledgement it emits carries the flow size, so the
-// sender completes through the IsFinished it already had.
-void RdmaHw::AskRemainderVerdict(Ptr<RdmaRxQueuePair> q){
+// The step stop's question. The receive queue pair knows how far its
+// cumulative sequence has reached and not how large the flow is, so it asks
+// with the former and the frontend answers with the end offset. Absorbing that
+// range is what a forgiven trim already does, and the acknowledgement it emits
+// carries the flow size, so the sender completes through the IsFinished it
+// already had.
+void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	const uint64_t expected = q->ReceiverNextExpectedSeq;
 	// Under selective repeat the flow stalls on a gap while later packets keep
 	// arriving, so the bytes above the cumulative sequence are not all
@@ -930,6 +890,19 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 	}
 	RecoverTrimmedQueue(qp, ch);
 	return 0;
+}
+
+uint64_t RdmaHw::AcceptedPayloadBytes(Ptr<RdmaRxQueuePair> q, uint32_t seq,
+		uint32_t size) const {
+	// A packet below the cumulative sequence is a duplicate the receiver
+	// discards, and without selective retransmission one above it is dropped
+	// rather than accepted. What is left is the part of the range the receiver
+	// does not already hold, which is what AddOutOfOrderRange absorbs.
+	if (seq < q->ReceiverNextExpectedSeq)
+		return 0;
+	if (seq > q->ReceiverNextExpectedSeq && !m_selective_retransmission)
+		return 0;
+	return q->UnsettledBytes(seq, static_cast<uint64_t>(seq) + size);
 }
 
 int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size){
