@@ -45,6 +45,8 @@ using AstraSimNs3::Pacing;
 using AstraSimNs3::StepLedger;
 using AstraSimNs3::forgave;
 using AstraSimNs3::kDecisionScale;
+using AstraSimNs3::kPacketPayload;
+using AstraSimNs3::spent_hard;
 using AstraSimNs3::range_coin;
 using AstraSimNs3::remainder_verdict;
 using AstraSimNs3::revokes_exemption;
@@ -82,6 +84,10 @@ StepLedger SettledCell(uint64_t eligible, uint64_t outstanding){
 	StepLedger cell;
 	cell.eligible = eligible;
 	cell.delivered = eligible - outstanding;
+	// The plan is part of every forgiving cell, because the spent report is
+	// measured against the step's total rather than against the cap that has
+	// vested so far.
+	cell.owed = eligible;
 	return cell;
 }
 
@@ -117,15 +123,96 @@ int main(){
 		Expect("a cap with room reports none spent",
 			revokes_exemption(answer.first), 0);
 	}
-	// A range above the cap is refused, nothing is charged, and the entry is
-	// reported spent because it could not take the range in front of it.
+	// A range above the cap is refused and nothing is charged. This one range
+	// is larger than the step's whole allowance, so refusing it is already
+	// more than the step could ever have absorbed and the report fires; a
+	// fabric range is one packet, so only a fixture reaches this in one trim.
 	{
 		const auto answer = trim_verdict(SettledCell(1000000, 200000),
 			kTenPercent, Pacing{NoPacing{}}, 0, 200000);
 		Expect("a range above the cap is repaired", forgave(answer.first), 0);
 		Expect("a refused range is not charged", answer.second.forgiven, 0);
-		Expect("a refusal reports the entry spent",
+		Expect("refusing more than the step could absorb reports spent",
 			revokes_exemption(answer.first), 1);
+	}
+	// The hard report against the step's total: no further range will ever be
+	// affordable this step, one packet's payload being the largest range a
+	// trim can carry. Ten-byte packets here, so the boundary is readable.
+	{
+		StepLedger cell;
+		cell.owed = 1000;  // p x owed is 100 bytes at kTenPercent
+		cell.forgiven = 89;
+		Expect("one packet still fits under the hard cap",
+			spent_hard(cell, kTenPercent, 10) ? 1 : 0, 0);
+		cell.forgiven = 90;
+		Expect("a packet that exactly fills the cap still fits",
+			spent_hard(cell, kTenPercent, 10) ? 1 : 0, 0);
+		cell.forgiven = 91;
+		Expect("the hard cap reports spent when no packet fits",
+			spent_hard(cell, kTenPercent, 10) ? 1 : 0, 1);
+	}
+	// A soft refusal sets no bit and is counted: the vesting cap will grow, so
+	// the refusal says nothing about the rest of the step.
+	{
+		StepLedger cell;
+		cell.eligible = 1000000;
+		cell.owed = 1000000;
+		cell.delivered = 100000;  // affords 11111 under the soft cap
+		const auto answer = trim_verdict(cell, kTenPercent,
+			Pacing{NoPacing{}}, 0, 20000);
+		Expect("the soft cap refuses what has not vested",
+			forgave(answer.first), 0);
+		Expect("a soft refusal sets no bit", revokes_exemption(answer.first),
+			0);
+		Expect("a soft refusal is counted", answer.second.refused_soft, 20000);
+	}
+	// The flooding sender. Delivery stalls, so the soft cap stalls with it and
+	// `forgiven` never grows; the report fires on the refusals themselves,
+	// exactly when they pass what the step could ever have absorbed.
+	{
+		StepLedger cell;
+		cell.eligible = 1000000;
+		cell.owed = 1000000;  // the step's allowance is 100000 bytes
+		bool reported = false;
+		for (int trim = 0; trim < 5; trim++){
+			const auto answer = trim_verdict(cell, kTenPercent,
+				Pacing{NoPacing{}}, 0, 30000);
+			Expect("nothing vests, so nothing is forgiven",
+				forgave(answer.first), 0);
+			cell = answer.second;
+			reported = revokes_exemption(answer.first);
+			Expect("the report fires once the refusals pass the allowance",
+				reported ? 1 : 0, cell.refused_soft > 100000 ? 1 : 0);
+		}
+		Expect("the flooding sender is told to obey its controller",
+			reported ? 1 : 0, 1);
+		Expect("every refused byte was counted", cell.refused_soft, 150000);
+	}
+	// A coin refusal counts in neither: the receiver chose it, and the fabric
+	// asked for nothing it could not have.
+	{
+		const Pacing never{Bernoulli{1}};
+		const auto answer = trim_verdict(SettledCell(1000000, 1000),
+			kTenPercent, never, kDecisionScale - 1, 1000);
+		Expect("a coin refusal forgives nothing", forgave(answer.first), 0);
+		Expect("a coin refusal is not a soft refusal",
+			answer.second.refused_soft, 0);
+		Expect("a coin refusal sets no bit", revokes_exemption(answer.first),
+			0);
+	}
+	// Under the ablation the cap in force is the hard one, so there is no soft
+	// refusal to count and the first clause is the whole rule.
+	{
+		for (uint64_t bytes = 1000; bytes <= 500000; bytes *= 5){
+			StepLedger cell;
+			cell.eligible = 1000000;
+			cell.owed = 1000000;
+			cell.owed_base = true;
+			const auto answer = trim_verdict(cell, kTenPercent,
+				Pacing{NoPacing{}}, 0, bytes);
+			Expect("the ablation counts no soft refusals",
+				answer.second.refused_soft, 0);
+		}
 	}
 	// The spent bit after a charge asks about one further byte, which is the
 	// smallest range any later trim could carry.
@@ -159,6 +246,7 @@ int main(){
 		for (uint64_t delivered = 0; delivered <= 1000000; delivered += 50000){
 			StepLedger cell;
 			cell.eligible = 1000000;
+			cell.owed = 1000000;
 			cell.delivered = delivered;
 			const bool now = forgave(trim_verdict(cell, kTenPercent,
 				Pacing{NoPacing{}}, 0, bytes).first);
@@ -173,6 +261,7 @@ int main(){
 		for (uint64_t forgiven = 0; forgiven <= 200000; forgiven += 10000){
 			StepLedger cell;
 			cell.eligible = 1000000;
+			cell.owed = 1000000;
 			cell.delivered = 800000;
 			cell.forgiven = forgiven;
 			const bool now = forgave(trim_verdict(cell, kTenPercent,
@@ -190,6 +279,7 @@ int main(){
 	{
 		StepLedger cell;
 		cell.eligible = 1000000;
+		cell.owed = 1000000;
 		for (uint64_t bytes = 1; bytes <= 100000; bytes *= 10){
 			Expect("nothing is forgiven before anything arrives",
 				forgave(trim_verdict(cell, kTenPercent, Pacing{NoPacing{}}, 0,
@@ -244,27 +334,31 @@ int main(){
 		Expect("the cap still bounds a stopped sender",
 			remainder_verdict(cell, kTenPercent, 300, 1, true).first, 0);
 	}
-	// The coin is deterministic per (flow, start), so a range the coin refuses
-	// stays refused however often it is re-trimmed, and a range it admits
-	// stays admitted.
+	// The coin is drawn per trimmed arrival: the same range asked twice draws
+	// twice, so a refusal is not remembered and the range meets the cap as it
+	// stands on its next trim. Two arms at one seed draw the same sequence,
+	// because the attempt number is the flow's own count of verdicts.
 	{
 		const uint64_t flow_hash = 0x5eed1234abcdULL;
 		uint64_t admitted = 0;
+		uint64_t redrawn = 0;
 		for (uint64_t start = 0; start < 4096 * 64; start += 4096){
-			const uint64_t coin = range_coin(flow_hash, start);
-			Expect("the coin repeats for one (flow, start)",
-				range_coin(flow_hash, start), coin);
+			const uint32_t attempt =
+				static_cast<uint32_t>(start / 4096) + 1;
+			const uint64_t coin = range_coin(flow_hash, start, attempt);
+			Expect("one arm repeats the other's draw",
+				range_coin(flow_hash, start, attempt), coin);
 			Expect("the coin is inside the decision scale",
 				coin < kDecisionScale, 1);
+			redrawn += range_coin(flow_hash, start, attempt + 1) != coin ? 1
+				: 0;
 			const Pacing half{Bernoulli{kDecisionScale / 2}};
-			const auto first = trim_verdict(SettledCell(1000000, 1000),
-				kTenPercent, half, coin, 1000);
-			const auto again = trim_verdict(SettledCell(1000000, 1000),
-				kTenPercent, half, coin, 1000);
-			Expect("a re-trimmed range gets the same verdict",
-				first.first, again.first);
-			admitted += forgave(first.first) ? 1 : 0;
+			admitted += forgave(trim_verdict(SettledCell(1000000, 1000),
+				kTenPercent, half, coin, 1000).first) ? 1 : 0;
 		}
+		// 64 ranges. A coin that ignored the attempt would redraw none of
+		// them; collisions at one in a million make a few plausible.
+		Expect("the same range asked twice draws two coins", redrawn > 60, 1);
 		// 64 draws at p = 0.5. A coin that ignored its inputs would sit at 0
 		// or 64, which is all this needs to exclude.
 		Expect("the coin admits some ranges and refuses others",
@@ -339,6 +433,7 @@ int main(){
 	{
 		ForgivenessLedger ledger = ForgivenessLedger::make(4, 3);
 		ledger.register_eligible(2, 1, 1000000);
+		ledger.register_owed(2, 1, 3, 1000000);
 		Expect("an open entry is available", ledger.open_cell(2, 1) != nullptr,
 			1);
 		ledger.close(2, 1);
@@ -355,6 +450,7 @@ int main(){
 	{
 		ForgivenessLedger ledger = ForgivenessLedger::make(2, 1);
 		ledger.register_eligible(0, 1, 1000000);
+		ledger.register_owed(0, 1, 1, 1000000);
 		Expect("an entry that has received nothing has nothing to spend",
 			forgave(trim_verdict(*ledger.open_cell(0, 1), kTenPercent,
 				Pacing{NoPacing{}}, 0, 1000).first), 0);
@@ -366,6 +462,53 @@ int main(){
 			ledger.open_cell(0, 1)->by_sender.at(1).delivered, 500000);
 		Expect("no other sender is credited",
 			ledger.open_cell(0, 1)->by_sender.count(2), 0);
+	}
+	// The arrival that carries a sender across 1 - p is the one that stops it,
+	// and it stops that sender alone. The receiver acts on that arrival
+	// because a flow waiting on a repair receives nothing.
+	{
+		AstraSimNs3::experiment_config.enabled = true;
+		AstraSimNs3::experiment_config.domain =
+			AstraSimNs3::SheddingDomain::Recovery;
+		AstraSimNs3::experiment_config.step_stop = true;
+		AstraSimNs3::experiment_config.p_high_threshold = kTenPercent;
+		AstraSimNs3::experiment_config.clr_mask_by_step[1] = false;
+		AstraSimNs3::forgiveness_ledger = ForgivenessLedger::make(4, 1);
+		AstraSimNs3::forgiveness_ledger.register_eligible(0, 1, 2000);
+		AstraSimNs3::forgiveness_ledger.register_owed(0, 1, 1, 1000);
+		AstraSimNs3::forgiveness_ledger.register_owed(0, 1, 2, 1000);
+
+		// Two open flows from sender 1 and one from sender 2.
+		AstraSimNs3::FlowRecord first;
+		first.admission_eligible = true;
+		first.src = 1;
+		first.dst = 0;
+		first.operation.training_step = 1;
+		AstraSimNs3::FlowRecord second = first;
+		AstraSimNs3::FlowRecord other = first;
+		other.src = 2;
+
+		Expect("an arrival short of 1 - p stops nobody",
+			AstraSimNs3::note_delivered(first, 899) ? 1 : 0, 0);
+		Expect("the arrival that crosses 1 - p stops its sender",
+			AstraSimNs3::note_delivered(second, 1) ? 1 : 0, 1);
+		Expect("the next arrival from that sender stops nobody again",
+			AstraSimNs3::note_delivered(first, 1) ? 1 : 0, 0);
+		Expect("the other sender is untouched",
+			AstraSimNs3::note_delivered(other, 899) ? 1 : 0, 0);
+
+		// Both of the stopped sender's flows are forgiven their holes on that
+		// crossing; the other sender's is not.
+		const StepLedger *cell =
+			AstraSimNs3::forgiveness_ledger.open_cell(0, 1);
+		Expect("the stopped sender's first flow is forgiven its hole",
+			remainder_verdict(*cell, kTenPercent, 50, 1, true).first, 50);
+		Expect("the stopped sender's second flow is forgiven its hole",
+			remainder_verdict(*cell, kTenPercent, 40, 1, true).first, 40);
+		Expect("the other sender's flow keeps its remainder",
+			remainder_verdict(*cell, kTenPercent, 50, 2, true).first, 0);
+		AstraSimNs3::experiment_config = AstraSimNs3::ExperimentConfig{};
+		AstraSimNs3::forgiveness_ledger = ForgivenessLedger{};
 	}
 	// A trim of an untouched range charges its whole length.
 	{

@@ -50,6 +50,10 @@ public:
 	// before the first send.
 	uint32_t m_cc_signals_withheld;
 	uint32_t m_allowance_spent_signalled;
+	// When the receiver granted this queue pair its exemption, and when a
+	// spent report ended it. Zero means never; the grant is one way, so a
+	// queue pair that re-armed is never granted again.
+	uint64_t m_cc_exempt_granted_ns;
 	uint64_t m_cc_rearmed_ns;
 	// Simulated times of the first trim notification received and the first
 	// repair packet sent. Zero means never: no packet can be trimmed or
@@ -179,6 +183,11 @@ public:
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	// Out-of-order payload ranges accepted under selective retransmission.
 	std::map<uint64_t, uint64_t> m_ooo_ranges;
+	// Whether the experiment layer may forgive this flow on this step, asked
+	// once when the queue pair is created. Every acknowledgement this queue
+	// pair emits carries it, and an acknowledgement carrying it without the
+	// allowance report is what grants the sender its exemption.
+	bool m_forgiveness_eligible;
 	static TypeId GetTypeId (void);
 	RdmaRxQueuePair();
 	uint32_t GetHash(void);

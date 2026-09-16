@@ -48,6 +48,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_cc_exempt = false;
 	m_cc_signals_withheld = 0;
 	m_allowance_spent_signalled = 0;
+	m_cc_exempt_granted_ns = 0;
 	m_cc_rearmed_ns = 0;
 	m_first_trim_ns = 0;
 	m_first_repair_ns = 0;
@@ -324,6 +325,7 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
+	m_forgiveness_eligible = false;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){

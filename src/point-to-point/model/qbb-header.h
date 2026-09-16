@@ -29,7 +29,13 @@ public:
     // The receiver reports that the budget entry this range belongs to has no
     // allowance left. It is the only thing a sender cannot work out for
     // itself, and the only thing that ends its congestion exemption.
-    FLAG_ALLOWANCE_EXHAUSTED = 2
+    FLAG_ALLOWANCE_EXHAUSTED = 2,
+    // The receiver reports that this flow is one it may forgive on this step.
+    // An acknowledgement carrying it with FLAG_ALLOWANCE_EXHAUSTED clear is
+    // the grant: from it the sender withholds congestion signals. The sender
+    // cannot know either fact, because eligibility and the step's phase are
+    // the receiver's, so the grant is the receiver's to give.
+    FLAG_FORGIVENESS_ELIGIBLE = 3
   };
   qbbHeader (uint16_t pg);
   qbbHeader ();
@@ -48,6 +54,7 @@ public:
   void SetTrimPayloadSize(uint32_t payloadSize);
   void SetTrimLastHop(bool lastHop);
   void SetAllowanceExhausted(bool spent);
+  void SetForgivenessEligible(bool eligible);
   void SetIntHeader(const IntHeader &_ih);
 
 //Getters

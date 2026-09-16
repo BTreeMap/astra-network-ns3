@@ -101,6 +101,14 @@ TypeId RdmaHw::GetTypeId (void)
 				BooleanValue(false),
 				MakeBooleanAccessor(&RdmaHw::m_congestionExemption),
 				MakeBooleanChecker())
+		.AddAttribute("Reengage",
+				"Whether the receiver's report that a step's budget is spent "
+				"ends that queue pair's congestion exemption. False is the "
+				"reference arm: the report is still carried and counted, and "
+				"the exemption stands, so the budget alone bounds the loss.",
+				BooleanValue(true),
+				MakeBooleanAccessor(&RdmaHw::m_reengage),
+				MakeBooleanChecker())
 		.AddAttribute("EwmaGain",
 				"Control gain parameter which determines the level of rate decrease",
 				DoubleValue(1.0 / 16),
@@ -303,9 +311,6 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	// Congestion response is decided once, at birth. The experiment layer owns
 	// eligibility, the step and the budget; the transport supplies a five-tuple
 	// and stores the answer.
-	qp->m_cc_exempt = m_congestionExemption &&
-		!m_congestionExemptionCallback.IsNull() &&
-		m_congestionExemptionCallback(sip.Get(), dip.Get(), sport, dport);
 	// add qp
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].qpGrp->AddQp(qp);
@@ -357,6 +362,11 @@ Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport,
 		q->sport = sport;
 		q->dport = dport;
 		q->m_ecn_source.qIndex = pg;
+		// Asked once, in the frontend's own five-tuple order: the sender's
+		// address and port first. The answer cannot change within a flow,
+		// because eligibility and the step are fixed when it is created.
+		q->m_forgiveness_eligible = !m_forgivenessEligibleCallback.IsNull() &&
+			m_forgivenessEligibleCallback(dip, sip, dport, sport);
 		// store in map
 		m_rxQpMap[key] = q;
 		return q;
@@ -431,18 +441,22 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	const uint64_t accepted =
 		AcceptedPayloadBytes(rxQp, ch.udp.seq, payload_size);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
-	if (accepted > 0 && !m_dataAcceptedCallback.IsNull())
-		m_dataAcceptedCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
-			accepted);
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
 			ch.udp.ih, x == 2, ecnbits != 0, false);
 	}
-	// After the acknowledgement, so the question reads the cumulative sequence
-	// this packet already advanced. Asked on every accepted arrival: the
-	// frontend answers no until the step's plan says this sender is done, so
-	// the transport needs no timer and no threshold of its own.
+	// After the acknowledgement, so this packet's answer carries the state
+	// this packet produced and anything the report below absorbs is
+	// acknowledged separately. The report can stop other flows from the same
+	// sender, and this one: the frontend's budget decides.
+	if (accepted > 0 && !m_dataAcceptedCallback.IsNull())
+		m_dataAcceptedCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+			accepted);
+	// Asked on every accepted arrival: the frontend answers no until the
+	// step's plan says this sender is done, so the transport needs no timer
+	// and no threshold of its own. A flow the report above already stopped has
+	// no hole left and is refused here.
 	if (accepted > 0 && !m_remainderVerdictCallback.IsNull())
 		AskRemainderOnArrival(rxQp);
 	return 0;
@@ -467,6 +481,10 @@ void RdmaHw::SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 	if (cnp)
 		seqh.SetCnp();
 	seqh.SetAllowanceExhausted(spent);
+	// The grant is this flag without the report above. A receiver that may not
+	// forgive this flow, or a step that is critical, never sets it, so those
+	// senders obey their controller throughout.
+	seqh.SetForgivenessEligible(q->m_forgiveness_eligible);
 
 	Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
 	newp->AddHeader(seqh);
@@ -552,6 +570,11 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	// that closes the transfer. The re-arm comes first, so the congestion
 	// signal riding the same ACK reaches the controller.
 	EndExemptionIfAllowanceSpent(qp, ch);
+	// After the report, so an acknowledgement that carries both leaves the
+	// queue pair obeying its controller, and only on an acknowledgement: a
+	// repair request is not the receiver saying it has room.
+	if (ch.l3Prot == 0xFC)
+		GrantExemptionIfEligible(qp, ch);
 	if (cnp && m_cc_mode == 1 && DeliverCongestionSignal(qp)){ // mlx version
 		cnp_received_mlx(qp);
 	}
@@ -675,6 +698,25 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	m_nic[nicIdx].dev->TriggerTransmit();
 }
 
+// The receiver's grant. A sender obeys its controller until the receiver
+// acknowledges a flow it may forgive on a step that still has allowance, which
+// costs one round trip at the start of every flow and asks the sender to know
+// nothing about budgets. One way: a queue pair that has re-armed stays under
+// its controller for the rest of its life, so the exemption cannot flap with
+// the reports.
+void RdmaHw::GrantExemptionIfEligible(Ptr<RdmaQueuePair> qp,
+		const CustomHeader &ch){
+	if (!m_congestionExemption || qp->m_cc_exempt || qp->m_cc_rearmed_ns != 0)
+		return;
+	if (!((ch.ack.flags >> qbbHeader::FLAG_FORGIVENESS_ELIGIBLE) & 1))
+		return;
+	if ((ch.ack.flags >> qbbHeader::FLAG_ALLOWANCE_EXHAUSTED) & 1)
+		return;
+	qp->m_cc_exempt = true;
+	qp->m_cc_exempt_granted_ns = Simulator::Now().GetNanoSeconds();
+	ReportTransportEvent("cc_exempt_granted", 0);
+}
+
 // The receiver's report that the budget entry has no allowance left, which is
 // the one thing about a shared budget a sender cannot work out for itself. It
 // arrives on a repair request and on a forgiveness acknowledgement, because
@@ -686,6 +728,12 @@ void RdmaHw::EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
 	qp->m_allowance_spent_signalled++;
 	ReportTransportEvent("allowance_spent_signalled", 0);
 	if (!qp->m_cc_exempt)
+		return;
+	// The reference arm that never re-engages. The report is still carried
+	// and still counted, so the two arms differ in the sender's reaction to
+	// it and in nothing else. Only an eligible flow on a permissive step is
+	// ever exempt, so this needs no phase of its own.
+	if (!m_reengage)
 		return;
 	qp->m_cc_exempt = false;
 	qp->m_cc_rearmed_ns = Simulator::Now().GetNanoSeconds();
@@ -860,6 +908,26 @@ void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	// finds this queue pair carries that same group.
 	SendAck(q, q->sip, q->dip, q->sport, q->dport, q->m_ecn_source.qIndex,
 		IntHeader(), false, false, false);
+}
+
+// The frontend names a flow by (sender, receiver, sender's port); the receive
+// queue pair map is keyed by the priority group as well, which the frontend
+// does not carry, so this scans. A receiver holds tens of open receive queue
+// pairs and a stop fires once per sender per step, so the scan is cheaper than
+// carrying a group through the frontend to make the key.
+bool RdmaHw::StopFlow(uint32_t sip, uint32_t dip, uint16_t sport,
+		uint16_t dport){
+	if (m_remainderVerdictCallback.IsNull())
+		return false;
+	for (auto &entry : m_rxQpMap){
+		Ptr<RdmaRxQueuePair> q = entry.second;
+		if (q->dip != sip || q->sip != dip || q->dport != sport ||
+				q->sport != dport)
+			continue;
+		AskRemainderOnArrival(q);
+		return true;
+	}
+	return false;
 }
 
 int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){

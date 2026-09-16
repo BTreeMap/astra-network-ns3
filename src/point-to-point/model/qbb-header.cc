@@ -64,6 +64,12 @@ namespace ns3 {
 		else
 			flags &= ~(1 << FLAG_ALLOWANCE_EXHAUSTED);
 	}
+	void qbbHeader::SetForgivenessEligible(bool eligible){
+		if (eligible)
+			flags |= 1 << FLAG_FORGIVENESS_ELIGIBLE;
+		else
+			flags &= ~(1 << FLAG_FORGIVENESS_ELIGIBLE);
+	}
 	void qbbHeader::SetIntHeader(const IntHeader &_ih){
 		ih = _ih;
 	}

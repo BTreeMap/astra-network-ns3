@@ -58,6 +58,9 @@ public:
 	// answers for takes no rate cut until the receiver refuses to forgive one
 	// of its trims. The transport asks once, at birth, and never learns why.
 	bool m_congestionExemption;
+	// Whether a spent report ends an exemption. False is the reference arm in
+	// which the budget alone bounds the loss.
+	bool m_reengage;
 	bool m_var_win, m_fast_react;
 	bool m_rateBound;
 	uint32_t m_total_pause_times; 
@@ -94,12 +97,14 @@ public:
 	typedef Callback<uint8_t, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
 		uint32_t> RecoveryVerdictCallback;
 	RecoveryVerdictCallback m_recoveryVerdictCallback;
-	// (sip, dip, sport, dport) -> may this queue pair ignore congestion
-	// signals. Unset means no, which is the behaviour of a transport with no
-	// exemption at all.
+	// (sip, dip, sport, dport) -> may the experiment layer forgive this flow
+	// on this step. Asked by the receiver, once per receive queue pair, and
+	// carried on every acknowledgement that queue pair emits: the sender
+	// cannot know either eligibility or the step's phase. Unset means no,
+	// which is the behaviour of a transport with no exemption at all.
 	typedef Callback<bool, uint32_t, uint32_t, uint16_t, uint16_t>
-		CongestionExemptionCallback;
-	CongestionExemptionCallback m_congestionExemptionCallback;
+		ForgivenessEligibleCallback;
+	ForgivenessEligibleCallback m_forgivenessEligibleCallback;
 	// (sip, dip, sport, dport, next_expected, accepted_above) -> the end offset
 	// the receiver may absorb without waiting for it, or zero to refuse. A
 	// second callback rather than a struct on the trim path: the trim verdict
@@ -164,6 +169,10 @@ public:
 		const IntHeader &ih, bool nack, bool cnp, bool spent);
 	// Read the receiver's allowance report off an arriving repair request or
 	// acknowledgement, and end the exemption when it says the entry is spent.
+	// The receiver's grant, read off an acknowledgement: eligible flow, step
+	// with allowance left. One way, and never after a re-arm.
+	void GrantExemptionIfEligible(Ptr<RdmaQueuePair> qp,
+		const CustomHeader &ch);
 	void EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
 		const CustomHeader &ch);
 	// Hand one congestion observation to whichever controller is configured.
@@ -177,6 +186,12 @@ public:
 	// by the frontend, which holds the budget and the step's plan; the
 	// question absorbs whatever the frontend grants.
 	void AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q);
+	// The same question, asked because the frontend's budget says this sender
+	// is done rather than because a packet arrived. A flow waiting on a repair
+	// receives nothing, so waiting for its next arrival would leave it stopped
+	// only by its timeout. False when this receiver holds no queue pair for
+	// the five-tuple, which is a flow that has already finished.
+	bool StopFlow(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport);
 	void QpComplete(Ptr<RdmaQueuePair> qp);
 	void QpFail(Ptr<RdmaQueuePair> qp, uint32_t reason);
 	void ArmRetransmissionTimeout(Ptr<RdmaQueuePair> qp);

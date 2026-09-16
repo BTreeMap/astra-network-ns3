@@ -1141,29 +1141,46 @@ void SetConfig() {
 }
 
 // `recovery_verdict` is the experiment layer's answer to "what do I do with
-// this trimmed range", `congestion_exemption` its answer to "may this queue
-// pair ignore congestion", and `remainder_verdict` its answer to "may I take
-// this quiet flow's unsent remainder as delivered": the transport asks, it
-// never decides. `data_accepted` is the one report in the other direction, the
+// this trimmed range", `forgiveness_eligible` its answer to "may I forgive
+// this flow on this step", which the receiver carries on its
+// acknowledgements, and `remainder_verdict` its answer to "may I take this
+// flow's remainder as delivered": the transport asks, it never decides. `data_accepted` is the one report in the other direction, the
 // payload bytes an arrival added to what the receiver holds, which is what the
 // receiver-local budget is measured against. Null callbacks with
 // `forgiveness` and `congestion_exempt` false leave the pull-everything,
 // congestion-obeying transport untouched, and a null `remainder_verdict` is
 // what disables the step stop.
+// The one call in the other direction, from the experiment layer into the
+// transport: the receiver's budget says a sender is done, so its open queue
+// pairs run the remainder path now instead of waiting for packets that may
+// never come. A lookup by rank rather than another function pointer, because
+// the node container already maps a rank to its transport and the caller knows
+// which rank is receiving.
+bool StopFlowAtReceiver(uint32_t receiver, uint32_t sip, uint32_t dip,
+                        uint16_t sport, uint16_t dport) {
+  if (receiver >= n.GetN())
+    return false;
+  Ptr<RdmaDriver> rdma = n.Get(receiver)->GetObject<RdmaDriver>();
+  if (rdma == nullptr || rdma->m_rdma == nullptr)
+    return false;
+  return rdma->m_rdma->StopFlow(sip, dip, sport, dport);
+}
+
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
                   uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
                                               uint16_t, uint64_t,
                                               uint32_t) = nullptr,
                   bool forgiveness = false,
-                  bool (*congestion_exemption)(uint32_t, uint32_t, uint16_t,
+                  bool (*forgiveness_eligible)(uint32_t, uint32_t, uint16_t,
                                                uint16_t) = nullptr,
                   bool congestion_exempt = false,
                   uint64_t (*remainder_verdict)(uint32_t, uint32_t, uint16_t,
                                                 uint16_t, uint64_t,
                                                 uint64_t) = nullptr,
                   void (*data_accepted)(uint32_t, uint32_t, uint16_t, uint16_t,
-                                        uint64_t) = nullptr) {
+                                        uint64_t) = nullptr,
+                  bool reengage = true) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1452,13 +1469,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
       rdmaHw->SetAttribute("Forgiveness", BooleanValue(forgiveness));
       rdmaHw->SetAttribute("CongestionExemption",
                            BooleanValue(congestion_exempt));
+      rdmaHw->SetAttribute("Reengage", BooleanValue(reengage));
       rdmaHw->m_transportEventCallback =
           MakeCallback(&record_host_transport_event);
       if (recovery_verdict != nullptr)
         rdmaHw->m_recoveryVerdictCallback = MakeCallback(recovery_verdict);
-      if (congestion_exemption != nullptr)
-        rdmaHw->m_congestionExemptionCallback =
-            MakeCallback(congestion_exemption);
+      if (forgiveness_eligible != nullptr)
+        rdmaHw->m_forgivenessEligibleCallback =
+            MakeCallback(forgiveness_eligible);
       if (remainder_verdict != nullptr)
         rdmaHw->m_remainderVerdictCallback = MakeCallback(remainder_verdict);
       if (data_accepted != nullptr)
