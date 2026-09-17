@@ -39,22 +39,30 @@ public:
 	// other mode and separates a CC-driven tail from a repair-driven one.
 	uint32_t m_cnp_received;
 	// Congestion response as a two-variant sum {obey, exempt}. A bool carries
-	// it because the transition is one-way and the value is read on the
-	// congestion path: set once at birth from the experiment layer's answer,
-	// cleared once by the receiver's report that the budget entry is spent. An
-	// exempt queue pair pays for congestion in bounded loss instead of rate.
+	// it because the value is read on the congestion path: it follows the
+	// latest report from the receiver, set while the budget has room and
+	// cleared while it has none. An exempt queue pair pays for congestion in
+	// bounded loss instead of rate.
 	bool m_cc_exempt;
-	// Congestion signals withheld from the controller while exempt, reports
-	// that the entry had no allowance left, and the simulated time the
-	// exemption ended. Zero time means it never did: no report can arrive
-	// before the first send.
+	// Congestion signals withheld from the controller while exempt, and
+	// reports that the entry had no allowance left.
 	uint32_t m_cc_signals_withheld;
-	uint32_t m_allowance_spent_signalled;
-	// When the receiver granted this queue pair its exemption, and when a
-	// spent report ended it. Zero means never; the grant is one way, so a
-	// queue pair that re-armed is never granted again.
+	uint32_t m_allowance_gone_reports;
+	// When the receiver granted this queue pair its exemption. Zero means
+	// never: no report can arrive before the first send.
 	uint64_t m_cc_exempt_granted_ns;
-	uint64_t m_cc_rearmed_ns;
+	// What the exemption cost over the transfer's life, now that it follows
+	// the report both ways: how many reports changed the bit, and how much
+	// simulated time the sender spent delivering signals to its controller
+	// after it had been granted. A flow that never saw a set bit spends none.
+	uint32_t m_cc_transitions;
+	uint64_t m_cc_obeying_ns;
+	// When the current stretch of obeying began, and the last report's bit
+	// with whether one has been seen at all. Zero means the queue pair is not
+	// obeying: no report can arrive at time zero.
+	uint64_t m_cc_obey_since_ns;
+	bool m_cc_report_seen;
+	bool m_cc_last_report;
 	// Simulated times of the first trim notification received and the first
 	// repair packet sent. Zero means never: no packet can be trimmed or
 	// repaired before the transfer's first send.
@@ -183,6 +191,17 @@ public:
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 	// Out-of-order payload ranges accepted under selective retransmission.
 	std::map<uint64_t, uint64_t> m_ooo_ranges;
+	// Ranges the experiment layer forgave on this flow. They are absorbed
+	// into m_ooo_ranges as though they had arrived, and AbsorbContiguousFrom
+	// erases them as the cumulative sequence passes, so the record of what was
+	// forgiven has to be kept apart from it. Its one reader counts the bytes
+	// that arrive late for a range already given up.
+	std::map<uint64_t, uint64_t> m_forgiven_ranges;
+	// The end of the highest byte range this receiver has seen any evidence
+	// of: a data packet that arrived and a trim header whose payload did not.
+	// Everything below it and not settled is a hole, and the budget report is
+	// measured against the sum of those.
+	uint64_t m_highest_seen_end;
 	// Whether the experiment layer may forgive this flow on this step, asked
 	// once when the queue pair is created. Every acknowledgement this queue
 	// pair emits carries it, and an acknowledgement carrying it without the
@@ -204,6 +223,22 @@ public:
 	// gap the flow is stalled on. The step stop subtracts it, because a byte
 	// that arrived is not a byte to forgive.
 	uint64_t AcceptedBytesAbove(uint64_t expected) const;
+	// Raise the highest sequence seen. Called for every accepted data packet
+	// and every trim header, because a trimmed payload is evidence the range
+	// exists just as an arrival is.
+	void NoteSeen(uint64_t end);
+	// Bytes below the highest sequence seen that are neither received nor
+	// forgiven. A range trimmed three times is one hole, and a hole vanishes
+	// when its repair lands, so the count falls on its own.
+	uint64_t Holes() const;
+	// Record what a forgiveness of [start, end) actually gave up: the part of
+	// it the receiver did not already hold. Exactly the bytes the ledger was
+	// charged, so a later arrival inside it is a byte the budget paid for and
+	// the sender delivered anyway. Call before absorbing the range.
+	void NoteForgiven(uint64_t start, uint64_t end);
+	// Bytes of [start, end) that lie inside a range already forgiven, which is
+	// what a late arrival for a given-up range costs.
+	uint64_t ForgivenBytes(uint64_t start, uint64_t end) const;
 };
 
 class RdmaQueuePairGroup : public Object {

@@ -82,21 +82,25 @@ public:
 	TransportEventCallback m_transportEventCallback;
 	void ReportTransportEvent(const char* event, uint64_t bytes);
 
-	// What the receiver does with one trimmed range, and what it reports
-	// about the budget entry the range belongs to. The two are independent:
-	// forgiving a range can be the charge that empties the entry. The
-	// transport is semantics-blind and never reads a training step, a
+	// (sip, dip, sport, dport, seq, len) -> forgive this trimmed range, or
+	// repair it. One bit, because the receiver's report about the budget
+	// entry is a property of the entry and not of this range, and it is asked
+	// for separately below. Unset means repair, which is the behaviour of a
+	// transport with no recovery domain at all. The transport is
+	// semantics-blind and never reads a training step, a
 	// critical-learning-regime label, or a budget.
-	enum RecoveryVerdict : uint8_t {
-		kForgive = 1 << 0,
-		kAllowanceSpent = 1 << 1,
-	};
-	// (sip, dip, sport, dport, seq, len) -> RecoveryVerdict. Unset means zero,
-	// a repair with allowance left, which is the behaviour of a transport with
-	// no recovery domain at all.
-	typedef Callback<uint8_t, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
+	typedef Callback<bool, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
 		uint32_t> RecoveryVerdictCallback;
 	RecoveryVerdictCallback m_recoveryVerdictCallback;
+	// (sip, dip, sport, dport, holes) -> is the step's allowance gone. Asked
+	// wherever an acknowledgement or a repair request leaves the receiver,
+	// with the bytes this flow is missing right now; the frontend keeps the
+	// sum over the rank's flows and answers against the step's total. Unset
+	// means no, which leaves every sender following its controller only for
+	// as long as the grant below says nothing else.
+	typedef Callback<bool, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t>
+		AllowanceGoneCallback;
+	AllowanceGoneCallback m_allowanceGoneCallback;
 	// (sip, dip, sport, dport) -> may the experiment layer forgive this flow
 	// on this step. Asked by the receiver, once per receive queue pair, and
 	// carried on every acknowledgement that queue pair emits: the sender
@@ -117,14 +121,17 @@ public:
 	typedef Callback<uint64_t, uint32_t, uint32_t, uint16_t, uint16_t,
 		uint64_t, uint64_t> RemainderVerdictCallback;
 	RemainderVerdictCallback m_remainderVerdictCallback;
-	// (sip, dip, sport, dport, bytes) -> the payload bytes this arrival added
-	// to what the receiver holds. A NIC accounts for a byte when it accepts
-	// it, so the receiver-local budget grows here rather than at completion.
-	// Only newly accepted bytes are reported: a duplicate adds nothing, and a
-	// forgiven range was absorbed without data, so neither is counted twice.
+	// (sip, dip, sport, dport, accepted, late_forgiven) -> the payload bytes
+	// this arrival added to what the receiver holds, and the bytes of it that
+	// arrived for a range already forgiven. A NIC accounts for a byte when it
+	// accepts it, so the receiver-local budget grows here rather than at
+	// completion. Only newly accepted bytes are counted as accepted: a
+	// duplicate adds nothing, and a forgiven range was absorbed without data,
+	// so neither is counted twice; the late bytes are reported beside them
+	// because the budget was charged for a range the sender then delivered.
 	// Unset means the experiment layer keeps no receiver-side account.
-	typedef Callback<void, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t>
-		DataAcceptedCallback;
+	typedef Callback<void, uint32_t, uint32_t, uint16_t, uint16_t, uint64_t,
+		uint64_t> DataAcceptedCallback;
 	DataAcceptedCallback m_dataAcceptedCallback;
 	// What one arriving data packet would add, measured before the receive
 	// state moves. Go-back-N accepts nothing out of order, and a range the
@@ -163,18 +170,20 @@ public:
 	void RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
 	void SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent);
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent,
+		bool eligible);
 	void SendAck(Ptr<RdmaRxQueuePair> q, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
 		const IntHeader &ih, bool nack, bool cnp, bool spent);
-	// Read the receiver's allowance report off an arriving repair request or
-	// acknowledgement, and end the exemption when it says the entry is spent.
-	// The receiver's grant, read off an acknowledgement: eligible flow, step
-	// with allowance left. One way, and never after a re-arm.
-	void GrantExemptionIfEligible(Ptr<RdmaQueuePair> qp,
-		const CustomHeader &ch);
-	void EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
-		const CustomHeader &ch);
+	// Read the receiver's two bits off an arriving repair request or
+	// acknowledgement and follow them: eligible with room grants the
+	// exemption and eligible with none returns the sender to its controller,
+	// and a packet from a receiver that marks the flow ineligible says
+	// nothing either way.
+	void FollowAllowanceReport(Ptr<RdmaQueuePair> qp, const CustomHeader &ch);
+	// The receiver's report, recomputed where it is emitted: this queue pair's
+	// holes go to the frontend and the step's answer comes back.
+	bool AllowanceGone(Ptr<RdmaRxQueuePair> q);
 	// Hand one congestion observation to whichever controller is configured.
 	// False means the queue pair is exempt and the controller never hears of
 	// it, which is the whole of the exemption: no controller state moves,

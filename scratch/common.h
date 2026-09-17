@@ -1168,9 +1168,9 @@ bool StopFlowAtReceiver(uint32_t receiver, uint32_t sip, uint32_t dip,
 
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                   void (*qp_fail)(FILE *, Ptr<RdmaQueuePair>, uint32_t),
-                  uint8_t (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
-                                              uint16_t, uint64_t,
-                                              uint32_t) = nullptr,
+                  bool (*recovery_verdict)(uint32_t, uint32_t, uint16_t,
+                                           uint16_t, uint64_t,
+                                           uint32_t) = nullptr,
                   bool forgiveness = false,
                   bool (*forgiveness_eligible)(uint32_t, uint32_t, uint16_t,
                                                uint16_t) = nullptr,
@@ -1179,8 +1179,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
                                                 uint16_t, uint64_t,
                                                 uint64_t) = nullptr,
                   void (*data_accepted)(uint32_t, uint32_t, uint16_t, uint16_t,
-                                        uint64_t) = nullptr,
-                  bool reengage = true) {
+                                        uint64_t, uint64_t) = nullptr,
+                  bool reengage = true,
+                  bool (*allowance_gone)(uint32_t, uint32_t, uint16_t,
+                                         uint16_t, uint64_t) = nullptr) {
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -1481,6 +1483,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),
         rdmaHw->m_remainderVerdictCallback = MakeCallback(remainder_verdict);
       if (data_accepted != nullptr)
         rdmaHw->m_dataAcceptedCallback = MakeCallback(data_accepted);
+      if (allowance_gone != nullptr)
+        rdmaHw->m_allowanceGoneCallback = MakeCallback(allowance_gone);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       // create and install RdmaDriver

@@ -440,19 +440,25 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	// the account is of what this packet added to it.
 	const uint64_t accepted =
 		AcceptedPayloadBytes(rxQp, ch.udp.seq, payload_size);
+	const uint64_t range_end = static_cast<uint64_t>(ch.udp.seq) + payload_size;
+	// Bytes the receiver gave up on and the sender sent anyway. They are
+	// dropped here as any duplicate is; the budget keeps its charge, and the
+	// analyzer subtracts these to report what was actually lost.
+	const uint64_t late_forgiven = rxQp->ForgivenBytes(ch.udp.seq, range_end);
+	rxQp->NoteSeen(range_end);
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		SendAck(rxQp, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, x == 2, ecnbits != 0, false);
+			ch.udp.ih, x == 2, ecnbits != 0, AllowanceGone(rxQp));
 	}
 	// After the acknowledgement, so this packet's answer carries the state
 	// this packet produced and anything the report below absorbs is
 	// acknowledged separately. The report can stop other flows from the same
 	// sender, and this one: the frontend's budget decides.
-	if (accepted > 0 && !m_dataAcceptedCallback.IsNull())
+	if ((accepted > 0 || late_forgiven > 0) && !m_dataAcceptedCallback.IsNull())
 		m_dataAcceptedCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
-			accepted);
+			accepted, late_forgiven);
 	// Asked on every accepted arrival: the frontend answers no until the
 	// step's plan says this sender is done, so the transport needs no timer
 	// and no threshold of its own. A flow the report above already stopped has
@@ -564,17 +570,12 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
-	// Both flags report on the path, not on the bytes this ACK covers, so both
+	// Both flags report on the path, not on the bytes this ACK covers, so they
 	// are read before the acknowledgement that may complete the queue pair and
 	// return. A forgiven trim rides its own ACK, and that ACK is often the one
-	// that closes the transfer. The re-arm comes first, so the congestion
-	// signal riding the same ACK reaches the controller.
-	EndExemptionIfAllowanceSpent(qp, ch);
-	// After the report, so an acknowledgement that carries both leaves the
-	// queue pair obeying its controller, and only on an acknowledgement: a
-	// repair request is not the receiver saying it has room.
-	if (ch.l3Prot == 0xFC)
-		GrantExemptionIfEligible(qp, ch);
+	// that closes the transfer; reading the report first is what lets the
+	// congestion signal riding the same ACK reach the controller.
+	FollowAllowanceReport(qp, ch);
 	if (cnp && m_cc_mode == 1 && DeliverCongestionSignal(qp)){ // mlx version
 		cnp_received_mlx(qp);
 	}
@@ -665,7 +666,8 @@ int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch){
 // (DSCP_CONTROL / TC_high) and carries only the identity of the lost packet.
 void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 		uint32_t destinationIp, uint16_t sport, uint16_t dport, uint16_t pg,
-		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent){
+		uint32_t seq, uint32_t payloadSize, bool lastHop, bool spent,
+		bool eligible){
 	qbbHeader repair;
 	repair.SetSeq(seq);
 	repair.SetPG(pg);
@@ -674,6 +676,10 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	repair.SetTrimPayloadSize(payloadSize);
 	repair.SetTrimLastHop(lastHop);
 	repair.SetAllowanceExhausted(spent);
+	// The report is only a report where the receiver says it may forgive this
+	// flow; without this flag a clear bit means nothing, because a receiver
+	// with no budget at all also sends one.
+	repair.SetForgivenessEligible(eligible);
 	Ptr<Packet> packet = Create<Packet>(
 		std::max(60 - 14 - 20 - static_cast<int>(repair.GetSerializedSize()), 0));
 	packet->AddHeader(repair);
@@ -698,46 +704,67 @@ void RdmaHw::SendTrimNack(const CustomHeader &ch, uint32_t sourceIp,
 	m_nic[nicIdx].dev->TriggerTransmit();
 }
 
-// The receiver's grant. A sender obeys its controller until the receiver
-// acknowledges a flow it may forgive on a step that still has allowance, which
-// costs one round trip at the start of every flow and asks the sender to know
-// nothing about budgets. One way: a queue pair that has re-armed stays under
-// its controller for the rest of its life, so the exemption cannot flap with
-// the reports.
-void RdmaHw::GrantExemptionIfEligible(Ptr<RdmaQueuePair> qp,
+// The sender follows the latest report. A receiver that marks this flow
+// forgivable and has allowance left grants the exemption; the same receiver
+// reporting the allowance gone puts the sender back under its controller, and
+// a later report with room lets it withhold signals again. The controller
+// raises its own rate on its own timers when it hears nothing, so nothing
+// inside it is touched either way. A packet from a receiver that does not
+// mark the flow says nothing about forgiveness and is left alone, which is
+// every flow in every arm without the exemption.
+//
+// One round trip is spent obeying at the start of each flow, because the
+// first report cannot arrive sooner.
+void RdmaHw::FollowAllowanceReport(Ptr<RdmaQueuePair> qp,
 		const CustomHeader &ch){
-	if (!m_congestionExemption || qp->m_cc_exempt || qp->m_cc_rearmed_ns != 0)
+	const bool gone = (ch.ack.flags >> qbbHeader::FLAG_ALLOWANCE_EXHAUSTED) & 1;
+	if (gone){
+		qp->m_allowance_gone_reports++;
+		ReportTransportEvent("allowance_gone_reports", 0);
+	}
+	if (!m_congestionExemption)
 		return;
 	if (!((ch.ack.flags >> qbbHeader::FLAG_FORGIVENESS_ELIGIBLE) & 1))
 		return;
-	if ((ch.ack.flags >> qbbHeader::FLAG_ALLOWANCE_EXHAUSTED) & 1)
+	if (qp->m_cc_report_seen && gone != qp->m_cc_last_report){
+		qp->m_cc_transitions++;
+		ReportTransportEvent("cc_transition", 0);
+	}
+	qp->m_cc_report_seen = true;
+	qp->m_cc_last_report = gone;
+	const uint64_t now = Simulator::Now().GetNanoSeconds();
+	// The reference arm that never re-engages. Every report is still carried
+	// and still counted, so the two arms differ in the sender's reaction and
+	// in nothing else.
+	if (gone && !m_reengage)
 		return;
+	if (gone == !qp->m_cc_exempt)
+		return;
+	if (gone){
+		qp->m_cc_exempt = false;
+		qp->m_cc_obey_since_ns = now;
+		return;
+	}
 	qp->m_cc_exempt = true;
-	qp->m_cc_exempt_granted_ns = Simulator::Now().GetNanoSeconds();
-	ReportTransportEvent("cc_exempt_granted", 0);
+	if (qp->m_cc_exempt_granted_ns == 0){
+		qp->m_cc_exempt_granted_ns = now;
+		ReportTransportEvent("cc_exempt_granted", 0);
+		return;
+	}
+	// Back under the exemption after a stretch of obeying, which is what the
+	// obeying time is the sum of.
+	qp->m_cc_obeying_ns += now - qp->m_cc_obey_since_ns;
+	qp->m_cc_obey_since_ns = 0;
 }
 
-// The receiver's report that the budget entry has no allowance left, which is
-// the one thing about a shared budget a sender cannot work out for itself. It
-// arrives on a repair request and on a forgiveness acknowledgement, because
-// the charge that empties an entry is a forgiveness and no request follows it.
-void RdmaHw::EndExemptionIfAllowanceSpent(Ptr<RdmaQueuePair> qp,
-		const CustomHeader &ch){
-	if (!((ch.ack.flags >> qbbHeader::FLAG_ALLOWANCE_EXHAUSTED) & 1))
-		return;
-	qp->m_allowance_spent_signalled++;
-	ReportTransportEvent("allowance_spent_signalled", 0);
-	if (!qp->m_cc_exempt)
-		return;
-	// The reference arm that never re-engages. The report is still carried
-	// and still counted, so the two arms differ in the sender's reaction to
-	// it and in nothing else. Only an eligible flow on a permissive step is
-	// ever exempt, so this needs no phase of its own.
-	if (!m_reengage)
-		return;
-	qp->m_cc_exempt = false;
-	qp->m_cc_rearmed_ns = Simulator::Now().GetNanoSeconds();
-	ReportTransportEvent("cc_rearmed", 0);
+// The receiver's report, asked for wherever an acknowledgement or a repair
+// request leaves it. A queue pair the experiment layer does not mark has no
+// budget to report on, and its sender obeys its controller throughout.
+bool RdmaHw::AllowanceGone(Ptr<RdmaRxQueuePair> q){
+	if (m_allowanceGoneCallback.IsNull() || !q->m_forgiveness_eligible)
+		return false;
+	return m_allowanceGoneCallback(q->dip, q->sip, q->dport, q->sport,
+		q->Holes());
 }
 
 bool RdmaHw::DeliverCongestionSignal(Ptr<RdmaQueuePair> qp){
@@ -750,10 +777,10 @@ bool RdmaHw::DeliverCongestionSignal(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::RecoverTrimmedQueue(Ptr<RdmaQueuePair> qp,
 		const CustomHeader &ch){
-	// Before the stale check, because a stale report still describes a spent
+	// Before the stale check, because a stale report still describes the
 	// entry, and before the rate cut below, so this trim's own congestion
 	// signal reaches the controller.
-	EndExemptionIfAllowanceSpent(qp, ch);
+	FollowAllowanceReport(qp, ch);
 	const uint64_t trimStart = ch.ack.seq;
 	const uint64_t trimEnd = trimStart + ch.ack.trim_payload_size;
 	if (ch.ack.trim_payload_size == 0 || trimEnd <= qp->snd_una){
@@ -824,15 +851,18 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		ch.udp.pg, false);
 	if (q == nullptr){
 		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, payloadSize, lastHop, false);
+			ch.udp.seq, payloadSize, lastHop, false, false);
 		return;
 	}
 	const uint64_t start = ch.udp.seq;
 	const uint64_t end = start + payloadSize;
+	// A trimmed payload is evidence the range exists just as an arrival is,
+	// so it raises the frontier the holes are measured below.
+	q->NoteSeen(end);
 	const uint64_t unsettled = q->UnsettledBytes(start, end);
 	if (unsettled == 0){
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, false, false);
+			ch.udp.ih, false, false, AllowanceGone(q));
 		return;
 	}
 	if (unsettled < payloadSize){
@@ -841,16 +871,16 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// asserting an identity that holds vacuously.
 		ReportTransportEvent("clipped_trim", 0);
 	}
-	const uint8_t verdict = m_recoveryVerdictCallback.IsNull()
-		? uint8_t{0}
-		: m_recoveryVerdictCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+	const bool forgive = !m_recoveryVerdictCallback.IsNull() &&
+		m_recoveryVerdictCallback(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
 			start, static_cast<uint32_t>(unsettled));
-	const bool spent = (verdict & kAllowanceSpent) != 0;
-	if (verdict & kForgive){
+	if (forgive){
 		// Forgiving is absorbing: the range joins the accepted out-of-order
 		// set as though it had arrived, so the cumulative sequence can pass it
 		// and no repair is ever requested. It absorbs exactly the unsettled
-		// bytes, which is what the ledger was charged.
+		// bytes, which is what the ledger was charged, and the same bytes are
+		// recorded as given up before the absorb hides them.
+		q->NoteForgiven(start, end);
 		q->AddOutOfOrderRange(start, end);
 		// Beside the switch's trim_ftd_* events, so the reader can subtract:
 		// W' = (trimmed - forgiven) / offered.
@@ -865,11 +895,14 @@ void RdmaHw::ReceiveTrimmedData(const CustomHeader &ch, uint32_t payloadSize,
 		// debt is owed for every trim the sender would otherwise have seen, and
 		// this ACK is what pays it.
 		SendAck(q, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.ih, false, true, spent);
+			ch.udp.ih, false, true, AllowanceGone(q));
 		return;
 	}
+	// The refused range stays a hole, so the report is computed after the
+	// frontier moved and counts it.
 	SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-		ch.udp.seq, payloadSize, lastHop, spent);
+		ch.udp.seq, payloadSize, lastHop, AllowanceGone(q),
+		q->m_forgiveness_eligible);
 }
 
 // The step stop's question. The receive queue pair knows how far its
@@ -895,9 +928,14 @@ void RdmaHw::AskRemainderOnArrival(Ptr<RdmaRxQueuePair> q){
 	// charged, so the two sinks agree by construction rather than by the two
 	// sides computing the hole the same way.
 	const uint64_t forgiven = q->UnsettledBytes(expected, end);
+	q->NoteForgiven(expected, end);
 	q->AddOutOfOrderRange(expected, end);
+	q->NoteSeen(end);
 	q->ReceiverNextExpectedSeq =
 		static_cast<uint32_t>(q->AbsorbContiguousFrom(expected));
+	// The stop is this queue pair's last word. Nothing it sends afterwards
+	// grants an exemption or moves one, because the flow it spoke for is over.
+	q->m_forgiveness_eligible = false;
 	// Beside trim_forgiven, and separate from it: these bytes were never put
 	// on the wire, so they were never trimmed and W does not count them.
 	ReportTransportEvent("remainder_forgiven", forgiven);
@@ -947,7 +985,7 @@ int RdmaHw::ReceiveTrim(Ptr<Packet> p, CustomHeader &ch){
 			return 0;
 		}
 		SendTrimNack(ch, ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg,
-			ch.udp.seq, originalPayload, lastHop, false);
+			ch.udp.seq, originalPayload, lastHop, false, false);
 		return 0;
 	}
 

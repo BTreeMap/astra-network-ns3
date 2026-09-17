@@ -47,9 +47,13 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_cnp_received = 0;
 	m_cc_exempt = false;
 	m_cc_signals_withheld = 0;
-	m_allowance_spent_signalled = 0;
+	m_allowance_gone_reports = 0;
 	m_cc_exempt_granted_ns = 0;
-	m_cc_rearmed_ns = 0;
+	m_cc_transitions = 0;
+	m_cc_obeying_ns = 0;
+	m_cc_obey_since_ns = 0;
+	m_cc_report_seen = false;
+	m_cc_last_report = false;
 	m_first_trim_ns = 0;
 	m_first_repair_ns = 0;
 	m_last_progress_ns = Simulator::Now().GetNanoSeconds();
@@ -326,6 +330,7 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	m_milestone_rx = 0;
 	m_lastNACK = 0;
 	m_forgiveness_eligible = false;
+	m_highest_seen_end = 0;
 }
 
 uint32_t RdmaRxQueuePair::GetHash(void){
@@ -343,26 +348,93 @@ uint32_t RdmaRxQueuePair::GetHash(void){
 	return Hash32(buf.c, 12);
 }
 
-void RdmaRxQueuePair::AddOutOfOrderRange(uint64_t start, uint64_t end){
+namespace {
+
+// Merge [start, end) into a disjoint range set. Two sets are kept on a receive
+// queue pair, the accepted out-of-order bytes and the forgiven ones, and they
+// are merged and measured by the same algebra, so they share one
+// implementation rather than two that could drift.
+void AddRange(std::map<uint64_t, uint64_t> &ranges, uint64_t start,
+		uint64_t end){
 	if (start >= end)
 		return;
-	auto it = m_ooo_ranges.lower_bound(start);
-	if (it != m_ooo_ranges.begin()){
+	auto it = ranges.lower_bound(start);
+	if (it != ranges.begin()){
 		auto prev = std::prev(it);
 		if (prev->second >= start){
 			start = prev->first;
 			if (prev->second > end)
 				end = prev->second;
-			m_ooo_ranges.erase(prev);
+			ranges.erase(prev);
 		}
 	}
-	it = m_ooo_ranges.lower_bound(start);
-	while (it != m_ooo_ranges.end() && it->first <= end){
+	it = ranges.lower_bound(start);
+	while (it != ranges.end() && it->first <= end){
 		if (it->second > end)
 			end = it->second;
-		it = m_ooo_ranges.erase(it);
+		it = ranges.erase(it);
 	}
-	m_ooo_ranges[start] = end;
+	ranges[start] = end;
+}
+
+// Bytes of [start, end) the set covers. AddRange merges every overlapping and
+// touching range, so the entries are disjoint and no byte is counted twice.
+// The scan starts at the last entry beginning at or below start, the only one
+// that can reach into the range from the left.
+uint64_t CoveredBytes(const std::map<uint64_t, uint64_t> &ranges,
+		uint64_t start, uint64_t end){
+	if (start >= end)
+		return 0;
+	uint64_t covered = 0;
+	auto it = ranges.upper_bound(start);
+	if (it != ranges.begin())
+		--it;
+	for (; it != ranges.end() && it->first < end; ++it){
+		const uint64_t overlap_start = std::max(it->first, start);
+		const uint64_t overlap_end = std::min(it->second, end);
+		if (overlap_end > overlap_start)
+			covered += overlap_end - overlap_start;
+	}
+	return covered;
+}
+
+}  // namespace
+
+void RdmaRxQueuePair::AddOutOfOrderRange(uint64_t start, uint64_t end){
+	AddRange(m_ooo_ranges, start, end);
+}
+
+void RdmaRxQueuePair::NoteForgiven(uint64_t start, uint64_t end){
+	const uint64_t expected = static_cast<uint64_t>(ReceiverNextExpectedSeq);
+	if (start < expected)
+		start = expected;
+	uint64_t cursor = start;
+	auto it = m_ooo_ranges.upper_bound(start);
+	if (it != m_ooo_ranges.begin())
+		--it;
+	for (; it != m_ooo_ranges.end() && it->first < end && cursor < end; ++it){
+		if (it->second <= cursor)
+			continue;
+		if (it->first > cursor)
+			AddRange(m_forgiven_ranges, cursor, std::min(it->first, end));
+		cursor = std::max(cursor, it->second);
+	}
+	if (cursor < end)
+		AddRange(m_forgiven_ranges, cursor, end);
+}
+
+uint64_t RdmaRxQueuePair::ForgivenBytes(uint64_t start, uint64_t end) const{
+	return CoveredBytes(m_forgiven_ranges, start, end);
+}
+
+void RdmaRxQueuePair::NoteSeen(uint64_t end){
+	if (end > m_highest_seen_end)
+		m_highest_seen_end = end;
+}
+
+uint64_t RdmaRxQueuePair::Holes() const{
+	return UnsettledBytes(static_cast<uint64_t>(ReceiverNextExpectedSeq),
+		m_highest_seen_end);
 }
 
 uint64_t RdmaRxQueuePair::AbsorbContiguousFrom(uint64_t expected){
@@ -383,21 +455,7 @@ uint64_t RdmaRxQueuePair::UnsettledBytes(uint64_t start, uint64_t end) const{
 		start = expected;
 	if (start >= end)
 		return 0;
-	uint64_t unsettled = end - start;
-	// AddOutOfOrderRange merges every overlapping and touching range, so the
-	// entries are disjoint and no byte is subtracted twice. The scan starts at
-	// the last entry beginning at or below start, the only one that can reach
-	// into the range from the left.
-	auto it = m_ooo_ranges.upper_bound(start);
-	if (it != m_ooo_ranges.begin())
-		--it;
-	for (; it != m_ooo_ranges.end() && it->first < end; ++it){
-		const uint64_t overlap_start = std::max(it->first, start);
-		const uint64_t overlap_end = std::min(it->second, end);
-		if (overlap_end > overlap_start)
-			unsettled -= overlap_end - overlap_start;
-	}
-	return unsettled;
+	return (end - start) - CoveredBytes(m_ooo_ranges, start, end);
 }
 
 uint64_t RdmaRxQueuePair::AcceptedBytesAbove(uint64_t expected) const{
